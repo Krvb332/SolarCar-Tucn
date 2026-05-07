@@ -11,8 +11,8 @@
   Wiring used by this sketch:
     Teensy 4.1 pin 2, software TX  -> Nextion RX
     Teensy 4.1 pin 3, software RX  <- Nextion TX
-    Teensy 4.1 pin 17, Serial4 TX  -> ANT BMS RX
-    Teensy 4.1 pin 16, Serial4 RX  <- ANT BMS TX
+    Teensy 4.1 pin 12, software TX -> ANT BMS RX
+    Teensy 4.1 pin 11, software RX <- ANT BMS TX
     GND                    -> Nextion GND
     GND                    -> ANT BMS GND
     External 5 V supply    -> Nextion 5 V input
@@ -29,11 +29,11 @@
     x0    id=2   speed value, 1 decimal      t0  id=3  "Km/h"
     x1    id=4   RPM value, integer          t1  id=5  "RPM"
     tm0   id=6   HMI demo timer, disabled by Teensy
-    x2    id=12  left Tmp, 1 decimal         t6  id=11 "Tmp"
-    x3    id=13  left SOC, 1 decimal         t2  id=7  "SOC"
-    x4    id=14  left Volt, 1 decimal        t3  id=8  "Volt"
-    x5    id=15  left Amp, 1 decimal         t4  id=9  "Amp"
-    x6    id=16  left Pow, 1 decimal         t5  id=10 "Pow"
+    x2    id=12  BMS Tmp, 1 decimal          t6  id=11 "Tmp"
+    x3    id=13  BMS SOC, 1 decimal          t2  id=7  "SOC"
+    x4    id=14  BMS Volt, 1 decimal         t3  id=8  "Volt"
+    x5    id=15  BMS Amp, 1 decimal          t4  id=9  "Amp"
+    x6    id=16  BMS Pow, 1 decimal          t5  id=10 "Pow"
     x11   id=22  right Volt, 1 decimal       t11 id=21 "Volt"
     x10   id=20  right SOC, 1 decimal        t10 id=19 "SOC"
     x9    id=18  right Amp, 1 decimal        t9  id=17 "Amp"
@@ -50,30 +50,17 @@ namespace {
 constexpr uint32_t DEBUG_BAUD = 115200;
 constexpr uint32_t NEXTION_BAUD = 9600;
 constexpr uint32_t BMS_BAUD = 19200;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 250;
 constexpr uint32_t PAGE_HEARTBEAT_INTERVAL_MS = 1000;
 constexpr uint32_t BMS_REQUEST_INTERVAL_MS = 1000;
-constexpr uint32_t BMS_READ_SLICE_MS = 20;
-constexpr float SPEED_MAX = 130.0f;
-constexpr float SPEED_STEP = 0.8f;
-constexpr uint32_t RPM_MAX = 1700;
-constexpr uint32_t RPM_STEP = 50;
-constexpr float TEMPERATURE_MAX = 100.0f;
-constexpr float TEMPERATURE_STEP = 0.7f;
-constexpr float SOC_MAX = 100.0f;
-constexpr float SOC_STEP = 1.0f;
-constexpr float VOLTAGE_MAX = 60.0f;
-constexpr float VOLTAGE_STEP = 0.5f;
-constexpr float CURRENT_MAX = 30.0f;
-constexpr float CURRENT_STEP = 0.4f;
-constexpr float POWER_MAX = 1800.0f;
-constexpr float POWER_STEP = 25.0f;
-constexpr uint32_t CENTER_GAUGE_MAX = 100;
-constexpr uint32_t CENTER_GAUGE_STEP = 2;
+constexpr uint32_t BMS_RESPONSE_WINDOW_MS = 1000;
+constexpr uint32_t BMS_STALE_LOG_INTERVAL_MS = 3000;
+constexpr bool ENABLE_BMS_SERIAL_DEBUG = true;
+constexpr bool BMS_DEBUG_PRINT_RAW_FRAME = true;
+constexpr size_t BMS_DEBUG_RAW_BYTES_PER_LINE = 16;
 constexpr uint8_t NEXTION_RX_PIN = 3;
 constexpr uint8_t NEXTION_TX_PIN = 2;
-constexpr uint8_t BMS_RX_PIN = 16;
-constexpr uint8_t BMS_TX_PIN = 17;
+constexpr uint8_t BMS_RX_PIN = 11;
+constexpr uint8_t BMS_TX_PIN = 12;
 constexpr uint8_t NEXTION_TERMINATOR = 0xFF;
 constexpr uint8_t PAGE0_ID = 0;
 constexpr uint8_t ANT_REQUEST_CMD[6] = {0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00};
@@ -98,32 +85,15 @@ constexpr size_t OFFSET_TEMPS = 91;
 constexpr size_t OFFSET_MOS_CHARGE = 103;
 constexpr size_t OFFSET_MOS_DISCHARGE = 104;
 
+static_assert(OFFSET_CELLS + (ANT_CELL_COUNT * 2) <= ANT_FRAME_SIZE,
+              "BMS cell block must fit inside the ANT frame");
+static_assert(OFFSET_TEMPS + (ANT_TEMP_COUNT * 2) <= ANT_FRAME_SIZE,
+              "BMS temperature block must fit inside the ANT frame");
+static_assert(OFFSET_MOS_DISCHARGE < ANT_FRAME_SIZE,
+              "BMS MOS status offsets must fit inside the ANT frame");
+
 SoftwareSerial nextion(NEXTION_RX_PIN, NEXTION_TX_PIN);
-HardwareSerial &bmsSerial = Serial4;
-
-struct Telemetry {
-  float speedKmh;
-  uint32_t motorRpm;
-
-  float leftTemperature;
-  float leftSoc;
-  float leftVoltage;
-  float leftCurrent;
-  float leftPower;
-
-  float rightVoltage;
-  float rightSoc;
-  float rightCurrent;
-  float mpptTemperature;
-  float mpptPower;
-
-  float bmsVoltage;
-  float bmsCurrent;
-  float bmsPower;
-  float bmsTemperature;
-
-  uint16_t centerGauge;
-};
+SoftwareSerial bmsSerial(BMS_RX_PIN, BMS_TX_PIN);
 
 struct BmsTelemetry {
   float packVoltage = 0.0f;
@@ -145,16 +115,70 @@ struct BmsTelemetry {
   uint8_t maxCellId = 0;
 };
 
-Telemetry telemetry = {};
 BmsTelemetry bmsTelemetry = {};
 
-uint32_t lastTelemetryUpdate = 0;
 uint32_t lastPageHeartbeat = 0;
 uint32_t lastBmsRequest = 0;
 uint32_t lastBmsFrame = 0;
+uint32_t lastBmsStatusLog = 0;
+uint32_t bmsRequestCount = 0;
+uint32_t bmsFrameCount = 0;
+uint32_t bmsTimeoutCount = 0;
+uint32_t bmsRxOverflowCount = 0;
+uint32_t bmsDroppedNoiseBytes = 0;
+uint32_t bmsEchoBytesDiscarded = 0;
+size_t bmsBytesThisResponse = 0;
 uint8_t bmsRxBuffer[512] = {};
 size_t bmsRxLength = 0;
 bool hasBmsTelemetry = false;
+bool awaitingBmsResponse = false;
+
+enum class ActiveSoftwarePort {
+  None,
+  Nextion,
+  Bms,
+};
+
+ActiveSoftwarePort activeSoftwarePort = ActiveSoftwarePort::None;
+
+struct NextionCachedValue {
+  const char *component;
+  int32_t value;
+  bool valid;
+};
+
+NextionCachedValue nextionValueCache[] = {
+    {"x0", 0, false},  {"x1", 0, false},  {"x2", 0, false},  {"x3", 0, false},
+    {"x4", 0, false},  {"x5", 0, false},  {"x6", 0, false},  {"x7", 0, false},
+    {"x8", 0, false},  {"x9", 0, false},  {"x10", 0, false}, {"x11", 0, false},
+    {"z0", 0, false},
+};
+
+void activateNextionPort() {
+  if (activeSoftwarePort == ActiveSoftwarePort::Nextion) {
+    return;
+  }
+
+  if (activeSoftwarePort == ActiveSoftwarePort::Bms) {
+    bmsSerial.end();
+  }
+
+  nextion.begin(NEXTION_BAUD);
+  activeSoftwarePort = ActiveSoftwarePort::Nextion;
+}
+
+void activateBmsPort() {
+  if (activeSoftwarePort == ActiveSoftwarePort::Bms) {
+    return;
+  }
+
+  if (activeSoftwarePort == ActiveSoftwarePort::Nextion) {
+    nextion.end();
+  }
+
+  bmsSerial.begin(BMS_BAUD);
+  activeSoftwarePort = ActiveSoftwarePort::Bms;
+}
 
 void sendTerminator() {
   nextion.write(NEXTION_TERMINATOR);
@@ -163,18 +187,45 @@ void sendTerminator() {
 }
 
 void nextionCommand(const char *command) {
+  activateNextionPort();
   nextion.print(command);
   sendTerminator();
 }
 
 void setValue(const char *component, int32_t value) {
+  activateNextionPort();
   nextion.print(component);
   nextion.print(".val=");
   nextion.print(value);
   sendTerminator();
 }
 
+bool shouldSendValue(const char *component, int32_t value) {
+  for (NextionCachedValue &cached : nextionValueCache) {
+    if (strcmp(cached.component, component) != 0) {
+      continue;
+    }
+
+    if (cached.valid && cached.value == value) {
+      return false;
+    }
+
+    cached.value = value;
+    cached.valid = true;
+    return true;
+  }
+
+  return true;
+}
+
+void setValueIfChanged(const char *component, int32_t value) {
+  if (shouldSendValue(component, value)) {
+    setValue(component, value);
+  }
+}
+
 void setAttributeValue(const char *attribute, int32_t value) {
+  activateNextionPort();
   nextion.print(attribute);
   nextion.print('=');
   nextion.print(value);
@@ -191,36 +242,12 @@ int32_t scaledValue(float value, uint8_t decimals) {
   return static_cast<int32_t>(scaled >= 0.0f ? scaled + 0.5f : scaled - 0.5f);
 }
 
-void setXFloat(const char *component, float value, uint8_t decimals) {
+void setXFloatIfChanged(const char *component, float value, uint8_t decimals) {
+  setValueIfChanged(component, scaledValue(value, decimals));
+}
+
+void setXFloatFromBms(const char *component, float value, uint8_t decimals) {
   setValue(component, scaledValue(value, decimals));
-}
-
-float loopFloatValue(float value, float maxValue, float step, int8_t &direction) {
-  value += step * static_cast<float>(direction);
-  if (value >= maxValue) {
-    value = maxValue;
-    direction = -1;
-  } else if (value <= 0.0f) {
-    value = 0.0f;
-    direction = 1;
-  }
-
-  return value;
-}
-
-uint32_t loopUnsignedValue(uint32_t value, uint32_t maxValue, uint32_t step, int8_t &direction) {
-  int32_t nextValue = static_cast<int32_t>(value) +
-                      (static_cast<int32_t>(step) * direction);
-
-  if (nextValue >= static_cast<int32_t>(maxValue)) {
-    nextValue = static_cast<int32_t>(maxValue);
-    direction = -1;
-  } else if (nextValue <= 0) {
-    nextValue = 0;
-    direction = 1;
-  }
-
-  return static_cast<uint32_t>(nextValue);
 }
 
 uint16_t readU16BE(const uint8_t *p) {
@@ -267,11 +294,211 @@ float computeAverageBmsTemperature(const BmsTelemetry &source) {
   return sum / static_cast<float>(ANT_TEMP_COUNT);
 }
 
-void applyBmsTelemetryToDisplay() {
-  telemetry.bmsVoltage = bmsTelemetry.packVoltage;
-  telemetry.bmsCurrent = absoluteFloat(bmsTelemetry.packCurrent);
-  telemetry.bmsPower = absoluteFloat(bmsTelemetry.packVoltage * bmsTelemetry.packCurrent);
-  telemetry.bmsTemperature = computeAverageBmsTemperature(bmsTelemetry);
+void publishBmsTelemetry() {
+  const float packCurrent = absoluteFloat(bmsTelemetry.packCurrent);
+  const float packPower = absoluteFloat(bmsTelemetry.packVoltage * bmsTelemetry.packCurrent);
+  const float averageTemperature = computeAverageBmsTemperature(bmsTelemetry);
+
+  setXFloatFromBms("x3", bmsTelemetry.soc, 1);
+  setXFloatFromBms("x4", bmsTelemetry.packVoltage, 1);
+  setXFloatFromBms("x5", packCurrent, 1);
+  setXFloatFromBms("x6", packPower, 1);
+  setXFloatFromBms("x2", averageTemperature, 1);
+
+  setXFloatFromBms("x12", bmsTelemetry.packVoltage, 1);
+  setXFloatFromBms("x13", packCurrent, 1);
+  setXFloatFromBms("x14", packPower, 1);
+  setXFloatFromBms("x15", averageTemperature, 1);
+}
+
+void debugPrintHexByte(uint8_t value) {
+  if (value < 0x10) {
+    Serial.print('0');
+  }
+  Serial.print(value, HEX);
+}
+
+void debugPrintHexBlock(const uint8_t *data, size_t length) {
+  if (!ENABLE_BMS_SERIAL_DEBUG || !BMS_DEBUG_PRINT_RAW_FRAME) {
+    return;
+  }
+
+  for (size_t i = 0; i < length; ++i) {
+    if ((i % BMS_DEBUG_RAW_BYTES_PER_LINE) == 0) {
+      Serial.println();
+      Serial.print("[BMS raw ");
+      if (i < 100) {
+        Serial.print('0');
+      }
+      if (i < 10) {
+        Serial.print('0');
+      }
+      Serial.print(i);
+      Serial.print("] ");
+    }
+
+    debugPrintHexByte(data[i]);
+    Serial.print(' ');
+  }
+  Serial.println();
+}
+
+void clearBmsRxBuffer(const char *reason) {
+  if (bmsRxLength > 0) {
+    bmsDroppedNoiseBytes += static_cast<uint32_t>(bmsRxLength);
+    if (ENABLE_BMS_SERIAL_DEBUG) {
+      Serial.print("[BMS parser] cleared ");
+      Serial.print(bmsRxLength);
+      Serial.print(" stale byte(s)");
+      if (reason != nullptr) {
+        Serial.print(" before ");
+        Serial.print(reason);
+      }
+      Serial.println();
+    }
+  }
+
+  bmsRxLength = 0;
+}
+
+void debugPrintBmsTelemetry(const BmsTelemetry &source) {
+  if (!ENABLE_BMS_SERIAL_DEBUG) {
+    return;
+  }
+
+  Serial.print("[BMS decoded] Vpack=");
+  Serial.print(source.packVoltage, 1);
+  Serial.print("V Ipack=");
+  Serial.print(source.packCurrent, 1);
+  Serial.print("A SOC=");
+  Serial.print(source.soc, 0);
+  Serial.print("% Cap=");
+  Serial.print(source.capRemainAh, 2);
+  Serial.print('/');
+  Serial.print(source.capTotalAh, 2);
+  Serial.print("Ah Cycles=");
+  Serial.print(source.cycles);
+  Serial.print(" MOS(chg,dsg)=");
+  Serial.print(source.mosCharge ? 1 : 0);
+  Serial.print(',');
+  Serial.println(source.mosDischarge ? 1 : 0);
+
+  Serial.print("[BMS cells] active=");
+  Serial.print(source.activeCellCount);
+  Serial.print(" min=");
+  Serial.print(source.minCell, 3);
+  Serial.print("V #");
+  Serial.print(source.minCellId);
+  Serial.print(" max=");
+  Serial.print(source.maxCell, 3);
+  Serial.print("V #");
+  Serial.print(source.maxCellId);
+  Serial.print(" avg=");
+  Serial.print(source.avgCell, 3);
+  Serial.print("V delta=");
+  Serial.print(source.deltaCell, 3);
+  Serial.println("V");
+
+  Serial.print("[BMS temps] ");
+  for (uint8_t i = 0; i < ANT_TEMP_COUNT; ++i) {
+    Serial.print("T");
+    Serial.print(i + 1);
+    Serial.print('=');
+    Serial.print(source.temps[i], 1);
+    if (i < (ANT_TEMP_COUNT - 1)) {
+      Serial.print("C ");
+    }
+  }
+  Serial.println("C");
+
+  Serial.print("[BMS cell volts] ");
+  for (uint8_t i = 0; i < ANT_CELL_COUNT; ++i) {
+    if (source.cells[i] <= 0.0f) {
+      continue;
+    }
+
+    Serial.print(i + 1);
+    Serial.print('=');
+    Serial.print(source.cells[i], 3);
+    Serial.print("V ");
+  }
+  Serial.println();
+}
+
+void debugPrintBmsFrame(const uint8_t *frame, const BmsTelemetry &decoded) {
+  if (!ENABLE_BMS_SERIAL_DEBUG) {
+    return;
+  }
+
+  Serial.println();
+  Serial.print("[BMS frame #");
+  Serial.print(bmsFrameCount);
+  Serial.print("] bytes=");
+  Serial.print(ANT_FRAME_SIZE);
+  Serial.print(" responseBytes=");
+  Serial.print(bmsBytesThisResponse);
+  Serial.print(" rxOverflow=");
+  Serial.print(bmsRxOverflowCount);
+  Serial.print(" droppedNoise=");
+  Serial.println(bmsDroppedNoiseBytes);
+
+  debugPrintHexBlock(frame, ANT_FRAME_SIZE);
+  debugPrintBmsTelemetry(decoded);
+}
+
+void debugPrintBmsRequest() {
+  if (!ENABLE_BMS_SERIAL_DEBUG) {
+    return;
+  }
+
+  Serial.print("[BMS request #");
+  Serial.print(bmsRequestCount);
+  Serial.print("] t=");
+  Serial.print(millis());
+  Serial.print("ms cmd=");
+  for (size_t i = 0; i < sizeof(ANT_REQUEST_CMD); ++i) {
+    debugPrintHexByte(ANT_REQUEST_CMD[i]);
+    if (i < sizeof(ANT_REQUEST_CMD) - 1) {
+      Serial.print(' ');
+    }
+  }
+  Serial.print(" pins RX=");
+  Serial.print(BMS_RX_PIN);
+  Serial.print(" TX=");
+  Serial.print(BMS_TX_PIN);
+  Serial.print(" baud=");
+  Serial.print(BMS_BAUD);
+  Serial.print(" rxIdle=");
+  Serial.println(digitalRead(BMS_RX_PIN) == HIGH ? "HIGH" : "LOW");
+}
+
+void debugPrintBmsTimeout(uint32_t now) {
+  if (!ENABLE_BMS_SERIAL_DEBUG) {
+    return;
+  }
+
+  Serial.print("[BMS timeout #");
+  Serial.print(++bmsTimeoutCount);
+  Serial.print("] request #");
+  Serial.print(bmsRequestCount);
+  Serial.print(" waited=");
+  Serial.print(now - lastBmsRequest);
+  Serial.print("ms responseBytes=");
+  Serial.print(bmsBytesThisResponse);
+  Serial.print(" buffered=");
+  Serial.print(bmsRxLength);
+  Serial.print(" echoDiscarded=");
+  Serial.print(bmsEchoBytesDiscarded);
+  Serial.print(" rxIdle=");
+  Serial.print(digitalRead(BMS_RX_PIN) == HIGH ? "HIGH" : "LOW");
+  Serial.print(" hasTelemetry=");
+  Serial.println(hasBmsTelemetry ? "yes" : "no");
+
+  if (bmsRxLength > 0) {
+    const size_t debugLength = (bmsRxLength < ANT_FRAME_SIZE) ? bmsRxLength : ANT_FRAME_SIZE;
+    Serial.print("[BMS buffered preview]");
+    debugPrintHexBlock(bmsRxBuffer, debugLength);
+  }
 }
 
 int findBmsHeader(const uint8_t *data, size_t length) {
@@ -287,6 +514,30 @@ int findBmsHeader(const uint8_t *data, size_t length) {
   }
 
   return -1;
+}
+
+bool isLikelyBmsRequestEcho(const uint8_t *data, size_t length) {
+  if (length < 2 || length > sizeof(ANT_REQUEST_CMD)) {
+    return false;
+  }
+
+  return data[0] == ANT_REQUEST_CMD[0] && data[1] == ANT_REQUEST_CMD[1];
+}
+
+void discardLikelyBmsRequestEcho() {
+  if (!isLikelyBmsRequestEcho(bmsRxBuffer, bmsRxLength)) {
+    return;
+  }
+
+  bmsEchoBytesDiscarded += static_cast<uint32_t>(bmsRxLength);
+  if (ENABLE_BMS_SERIAL_DEBUG) {
+    Serial.print("[BMS echo] discarded ");
+    Serial.print(bmsRxLength);
+    Serial.print(" byte request echo/noise:");
+    debugPrintHexBlock(bmsRxBuffer, bmsRxLength);
+  }
+
+  bmsRxLength = 0;
 }
 
 void parseBmsCellBlock(const uint8_t *frame, BmsTelemetry &target) {
@@ -347,7 +598,10 @@ void parseBmsFrame(const uint8_t *frame) {
   bmsTelemetry = parsed;
   hasBmsTelemetry = true;
   lastBmsFrame = millis();
-  applyBmsTelemetryToDisplay();
+  awaitingBmsResponse = false;
+  ++bmsFrameCount;
+  debugPrintBmsFrame(frame, bmsTelemetry);
+  publishBmsTelemetry();
 }
 
 void compactBmsRxBuffer(size_t start, size_t count) {
@@ -364,15 +618,29 @@ void compactBmsRxBuffer(size_t start, size_t count) {
 
 void processBmsRxBuffer() {
   while (true) {
+    discardLikelyBmsRequestEcho();
+
     const int headerIndex = findBmsHeader(bmsRxBuffer, bmsRxLength);
     if (headerIndex < 0) {
       if (bmsRxLength > (ANT_FRAME_SIZE * 2)) {
+        bmsDroppedNoiseBytes += bmsRxLength;
+        if (ENABLE_BMS_SERIAL_DEBUG) {
+          Serial.print("[BMS parser] dropped ");
+          Serial.print(bmsRxLength);
+          Serial.println(" bytes with no ANT header");
+        }
         bmsRxLength = 0;
       }
       return;
     }
 
     if (headerIndex > 0) {
+      bmsDroppedNoiseBytes += static_cast<uint32_t>(headerIndex);
+      if (ENABLE_BMS_SERIAL_DEBUG) {
+        Serial.print("[BMS parser] resync dropped ");
+        Serial.print(headerIndex);
+        Serial.println(" byte(s) before ANT header");
+      }
       compactBmsRxBuffer(0, static_cast<size_t>(headerIndex));
       continue;
     }
@@ -387,37 +655,53 @@ void processBmsRxBuffer() {
 }
 
 void pollBmsUart() {
-  const uint32_t start = millis();
+  bool sawByte = false;
 
-  while (millis() - start < BMS_READ_SLICE_MS) {
-    while (bmsSerial.available() > 0) {
-      const int value = bmsSerial.read();
-      if (value < 0) {
-        break;
-      }
-
-      if (bmsRxLength < sizeof(bmsRxBuffer)) {
-        bmsRxBuffer[bmsRxLength++] = static_cast<uint8_t>(value);
-      } else {
-        bmsRxLength = 0;
-      }
+  while (bmsSerial.available() > 0) {
+    const int value = bmsSerial.read();
+    if (value < 0) {
+      break;
     }
 
+    sawByte = true;
+    ++bmsBytesThisResponse;
+    if (bmsRxLength < sizeof(bmsRxBuffer)) {
+      bmsRxBuffer[bmsRxLength++] = static_cast<uint8_t>(value);
+    } else {
+      ++bmsRxOverflowCount;
+      if (ENABLE_BMS_SERIAL_DEBUG) {
+        Serial.println("[BMS RX] local buffer overflow; clearing buffered bytes");
+      }
+      bmsRxLength = 0;
+    }
+  }
+
+  if (sawByte || bmsRxLength >= sizeof(ANT_HEADER)) {
     processBmsRxBuffer();
-    delay(1);
   }
 }
 
 void sendBmsRequestIfNeeded() {
+  if (awaitingBmsResponse) {
+    return;
+  }
+
   const uint32_t now = millis();
   if (now - lastBmsRequest >= BMS_REQUEST_INTERVAL_MS) {
-    bmsSerial.write(ANT_REQUEST_CMD, sizeof(ANT_REQUEST_CMD));
+    activateBmsPort();
     bmsSerial.flush();
+    clearBmsRxBuffer("request");
+    bmsSerial.write(ANT_REQUEST_CMD, sizeof(ANT_REQUEST_CMD));
     lastBmsRequest = now;
+    bmsBytesThisResponse = 0;
+    awaitingBmsResponse = true;
+    ++bmsRequestCount;
+    debugPrintBmsRequest();
   }
 }
 
 void changePage(const char *pageName) {
+  activateNextionPort();
   nextion.print("page ");
   nextion.print(pageName);
   sendTerminator();
@@ -450,15 +734,15 @@ const char *componentName(uint8_t componentId) {
     case 11:
       return "t6_tmp";
     case 12:
-      return "x2_left_tmp";
+      return "x2_bms_tmp";
     case 13:
-      return "x3_left_soc";
+      return "x3_bms_soc";
     case 14:
-      return "x4_left_volt";
+      return "x4_bms_volt";
     case 15:
-      return "x5_left_amp";
+      return "x5_bms_amp";
     case 16:
-      return "x6_left_pow";
+      return "x6_bms_pow";
     case 17:
       return "t9_right_amp";
     case 18:
@@ -506,65 +790,28 @@ const char *componentName(uint8_t componentId) {
   }
 }
 
-void publishTelemetry() {
-  setXFloat("x0", telemetry.speedKmh, 1);
-  setValue("x1", static_cast<int32_t>(telemetry.motorRpm));
+void clearDisplayValues() {
+  setXFloatIfChanged("x0", 0.0f, 1);
+  setValueIfChanged("x1", 0);
 
-  setXFloat("x2", telemetry.leftTemperature, 1);
-  setXFloat("x3", telemetry.leftSoc, 1);
-  setXFloat("x4", telemetry.leftVoltage, 1);
-  setXFloat("x5", telemetry.leftCurrent, 1);
-  setXFloat("x6", telemetry.leftPower, 1);
+  setXFloatIfChanged("x2", 0.0f, 1);
+  setXFloatIfChanged("x3", 0.0f, 1);
+  setXFloatIfChanged("x4", 0.0f, 1);
+  setXFloatIfChanged("x5", 0.0f, 1);
+  setXFloatIfChanged("x6", 0.0f, 1);
 
-  setXFloat("x11", telemetry.rightVoltage, 1);
-  setXFloat("x10", telemetry.rightSoc, 1);
-  setXFloat("x9", telemetry.rightCurrent, 1);
-  setXFloat("x7", telemetry.mpptTemperature, 1);
-  setXFloat("x8", telemetry.mpptPower, 1);
+  setXFloatIfChanged("x11", 0.0f, 1);
+  setXFloatIfChanged("x10", 0.0f, 1);
+  setXFloatIfChanged("x9", 0.0f, 1);
+  setXFloatIfChanged("x7", 0.0f, 1);
+  setXFloatIfChanged("x8", 0.0f, 1);
 
-  setXFloat("x12", telemetry.bmsVoltage, 1);
-  setXFloat("x13", telemetry.bmsCurrent, 1);
-  setXFloat("x14", telemetry.bmsPower, 1);
-  setXFloat("x15", telemetry.bmsTemperature, 1);
+  setXFloatFromBms("x12", 0.0f, 1);
+  setXFloatFromBms("x13", 0.0f, 1);
+  setXFloatFromBms("x14", 0.0f, 1);
+  setXFloatFromBms("x15", 0.0f, 1);
 
-  setValue("z0", telemetry.centerGauge);
-}
-
-void simulateTelemetry() {
-  static int8_t directions[] = {
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-  };
-  uint8_t directionIndex = 0;
-
-  telemetry.speedKmh = loopFloatValue(telemetry.speedKmh, SPEED_MAX, SPEED_STEP,
-                                      directions[directionIndex++]);
-  telemetry.motorRpm = loopUnsignedValue(telemetry.motorRpm, RPM_MAX, RPM_STEP,
-                                         directions[directionIndex++]);
-
-  telemetry.leftTemperature = loopFloatValue(telemetry.leftTemperature, TEMPERATURE_MAX,
-                                             TEMPERATURE_STEP, directions[directionIndex++]);
-  telemetry.leftSoc = loopFloatValue(telemetry.leftSoc, SOC_MAX, SOC_STEP,
-                                     directions[directionIndex++]);
-  telemetry.leftVoltage = loopFloatValue(telemetry.leftVoltage, VOLTAGE_MAX, VOLTAGE_STEP,
-                                         directions[directionIndex++]);
-  telemetry.leftCurrent = loopFloatValue(telemetry.leftCurrent, CURRENT_MAX, CURRENT_STEP,
-                                         directions[directionIndex++]);
-  telemetry.leftPower = loopFloatValue(telemetry.leftPower, POWER_MAX, POWER_STEP,
-                                       directions[directionIndex++]);
-
-  telemetry.rightVoltage = loopFloatValue(telemetry.rightVoltage, VOLTAGE_MAX, VOLTAGE_STEP,
-                                          directions[directionIndex++]);
-  telemetry.rightSoc = loopFloatValue(telemetry.rightSoc, SOC_MAX, SOC_STEP,
-                                      directions[directionIndex++]);
-  telemetry.rightCurrent = loopFloatValue(telemetry.rightCurrent, CURRENT_MAX, CURRENT_STEP,
-                                          directions[directionIndex++]);
-  telemetry.mpptTemperature = loopFloatValue(telemetry.mpptTemperature, TEMPERATURE_MAX,
-                                             TEMPERATURE_STEP, directions[directionIndex++]);
-  telemetry.mpptPower = loopFloatValue(telemetry.mpptPower, POWER_MAX, POWER_STEP,
-                                       directions[directionIndex++]);
-
-  telemetry.centerGauge = static_cast<uint16_t>(loopUnsignedValue(
-      telemetry.centerGauge, CENTER_GAUGE_MAX, CENTER_GAUGE_STEP, directions[directionIndex++]));
+  setValueIfChanged("z0", 0);
 }
 
 void handleTouchEvent(uint8_t pageId, uint8_t componentId, bool pressed) {
@@ -688,6 +935,7 @@ void readNextion() {
 
 void initialiseNextion() {
   delay(500);
+  activateNextionPort();
 
   nextionCommand("bkcmd=1");
   nextionCommand("recmod=0");
@@ -695,42 +943,77 @@ void initialiseNextion() {
   changePage("page0");
 
   setAttributeValue("tm0.en", 0);
-  publishTelemetry();
+  clearDisplayValues();
+}
+
+void logBmsStatusIfNeeded(uint32_t now) {
+  if (now - lastBmsStatusLog < BMS_STALE_LOG_INTERVAL_MS) {
+    return;
+  }
+
+  if (!hasBmsTelemetry) {
+    Serial.println("Waiting for ANT BMS frame...");
+    lastBmsStatusLog = now;
+    return;
+  }
+
+  if (now - lastBmsFrame >= BMS_STALE_LOG_INTERVAL_MS) {
+    Serial.println("No fresh ANT BMS frame for >3s");
+    lastBmsStatusLog = now;
+  }
+}
+
+bool isBmsResponseWindowActive(uint32_t now) {
+  if (!awaitingBmsResponse) {
+    return false;
+  }
+
+  if (now - lastBmsRequest < BMS_RESPONSE_WINDOW_MS) {
+    return true;
+  }
+
+  debugPrintBmsTimeout(now);
+  clearBmsRxBuffer("next request");
+  awaitingBmsResponse = false;
+  return false;
 }
 }  // namespace
 
 void setup() {
 
   Serial.begin(DEBUG_BAUD);
-  nextion.begin(NEXTION_BAUD);
-  bmsSerial.begin(BMS_BAUD);
 
   initialiseNextion();
 
   Serial.println("Teensy 4.1 Nextion page0 interface ready");
-  Serial.print("ANT BMS reader on Serial4 RX=");
+  Serial.print("ANT BMS reader on software serial RX=");
   Serial.print(BMS_RX_PIN);
   Serial.print(" TX=");
   Serial.print(BMS_TX_PIN);
   Serial.print(" baud=");
   Serial.println(BMS_BAUD);
+  Serial.print("BMS serial debug=");
+  Serial.println(ENABLE_BMS_SERIAL_DEBUG ? "enabled" : "disabled");
+  Serial.println("Open the serial monitor at 115200 baud to watch BMS requests, raw frames, and decoded values.");
 }
 
 void loop() {
-  const uint32_t now = millis();
-
   sendBmsRequestIfNeeded();
-  pollBmsUart();
-  readNextion();
 
-  if (now - lastTelemetryUpdate >= TELEMETRY_INTERVAL_MS) {
-    lastTelemetryUpdate = now;
-    simulateTelemetry();
-    publishTelemetry();
+  if (isBmsResponseWindowActive(millis())) {
+    pollBmsUart();
+    logBmsStatusIfNeeded(millis());
+    return;
   }
 
+  activateNextionPort();
+  readNextion();
+
+  uint32_t now = millis();
   if (now - lastPageHeartbeat >= PAGE_HEARTBEAT_INTERVAL_MS) {
     lastPageHeartbeat = now;
     nextionCommand("sendme");
   }
+
+  logBmsStatusIfNeeded(millis());
 }
