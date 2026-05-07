@@ -50,6 +50,7 @@ namespace {
 constexpr uint32_t DEBUG_BAUD = 115200;
 constexpr uint32_t NEXTION_BAUD = 9600;
 constexpr uint32_t BMS_BAUD = 19200;
+constexpr uint32_t LOOPED_TELEMETRY_INTERVAL_MS = 250;
 constexpr uint32_t PAGE_HEARTBEAT_INTERVAL_MS = 1000;
 constexpr uint32_t BMS_REQUEST_INTERVAL_MS = 1000;
 constexpr uint32_t BMS_RESPONSE_WINDOW_MS = 1000;
@@ -57,6 +58,22 @@ constexpr uint32_t BMS_STALE_LOG_INTERVAL_MS = 3000;
 constexpr bool ENABLE_BMS_SERIAL_DEBUG = true;
 constexpr bool BMS_DEBUG_PRINT_RAW_FRAME = true;
 constexpr size_t BMS_DEBUG_RAW_BYTES_PER_LINE = 16;
+constexpr float LOOPED_SPEED_MAX = 130.0f;
+constexpr float LOOPED_SPEED_STEP = 0.8f;
+constexpr uint32_t LOOPED_RPM_MAX = 1700;
+constexpr uint32_t LOOPED_RPM_STEP = 50;
+constexpr float LOOPED_TEMPERATURE_MAX = 100.0f;
+constexpr float LOOPED_TEMPERATURE_STEP = 0.7f;
+constexpr float LOOPED_SOC_MAX = 100.0f;
+constexpr float LOOPED_SOC_STEP = 1.0f;
+constexpr float LOOPED_VOLTAGE_MAX = 60.0f;
+constexpr float LOOPED_VOLTAGE_STEP = 0.5f;
+constexpr float LOOPED_CURRENT_MAX = 30.0f;
+constexpr float LOOPED_CURRENT_STEP = 0.4f;
+constexpr float LOOPED_POWER_MAX = 1800.0f;
+constexpr float LOOPED_POWER_STEP = 25.0f;
+constexpr uint32_t LOOPED_CENTER_GAUGE_MAX = 100;
+constexpr uint32_t LOOPED_CENTER_GAUGE_STEP = 2;
 constexpr uint8_t NEXTION_RX_PIN = 3;
 constexpr uint8_t NEXTION_TX_PIN = 2;
 constexpr uint8_t BMS_RX_PIN = 11;
@@ -115,8 +132,21 @@ struct BmsTelemetry {
   uint8_t maxCellId = 0;
 };
 
-BmsTelemetry bmsTelemetry = {};
+struct LoopedTelemetry {
+  float speedKmh = 0.0f;
+  uint32_t motorRpm = 0;
+  float rightVoltage = 0.0f;
+  float rightSoc = 0.0f;
+  float rightCurrent = 0.0f;
+  float mpptTemperature = 0.0f;
+  float mpptPower = 0.0f;
+  uint16_t centerGauge = 0;
+};
 
+BmsTelemetry bmsTelemetry = {};
+LoopedTelemetry loopedTelemetry = {};
+
+uint32_t lastLoopedTelemetryUpdate = 0;
 uint32_t lastPageHeartbeat = 0;
 uint32_t lastBmsRequest = 0;
 uint32_t lastBmsFrame = 0;
@@ -250,6 +280,35 @@ void setXFloatFromBms(const char *component, float value, uint8_t decimals) {
   setValue(component, scaledValue(value, decimals));
 }
 
+float loopFloatValue(float value, float maxValue, float step, int8_t &direction) {
+  value += step * static_cast<float>(direction);
+  if (value >= maxValue) {
+    value = maxValue;
+    direction = -1;
+  } else if (value <= 0.0f) {
+    value = 0.0f;
+    direction = 1;
+  }
+
+  return value;
+}
+
+uint32_t loopUnsignedValue(uint32_t value, uint32_t maxValue, uint32_t step,
+                           int8_t &direction) {
+  int32_t nextValue =
+      static_cast<int32_t>(value) + (static_cast<int32_t>(step) * direction);
+
+  if (nextValue >= static_cast<int32_t>(maxValue)) {
+    nextValue = static_cast<int32_t>(maxValue);
+    direction = -1;
+  } else if (nextValue <= 0) {
+    nextValue = 0;
+    direction = 1;
+  }
+
+  return static_cast<uint32_t>(nextValue);
+}
+
 uint16_t readU16BE(const uint8_t *p) {
   return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
 }
@@ -309,6 +368,49 @@ void publishBmsTelemetry() {
   setXFloatFromBms("x13", packCurrent, 1);
   setXFloatFromBms("x14", packPower, 1);
   setXFloatFromBms("x15", averageTemperature, 1);
+}
+
+void publishLoopedTelemetry() {
+  setXFloatIfChanged("x0", loopedTelemetry.speedKmh, 1);
+  setValueIfChanged("x1", static_cast<int32_t>(loopedTelemetry.motorRpm));
+
+  setXFloatIfChanged("x11", loopedTelemetry.rightVoltage, 1);
+  setXFloatIfChanged("x10", loopedTelemetry.rightSoc, 1);
+  setXFloatIfChanged("x9", loopedTelemetry.rightCurrent, 1);
+  setXFloatIfChanged("x7", loopedTelemetry.mpptTemperature, 1);
+  setXFloatIfChanged("x8", loopedTelemetry.mpptPower, 1);
+
+  setValueIfChanged("z0", loopedTelemetry.centerGauge);
+}
+
+void updateLoopedTelemetry() {
+  static int8_t directions[] = {1, 1, 1, 1, 1, 1, 1, 1};
+  uint8_t directionIndex = 0;
+
+  loopedTelemetry.speedKmh =
+      loopFloatValue(loopedTelemetry.speedKmh, LOOPED_SPEED_MAX, LOOPED_SPEED_STEP,
+                     directions[directionIndex++]);
+  loopedTelemetry.motorRpm =
+      loopUnsignedValue(loopedTelemetry.motorRpm, LOOPED_RPM_MAX, LOOPED_RPM_STEP,
+                        directions[directionIndex++]);
+  loopedTelemetry.rightVoltage =
+      loopFloatValue(loopedTelemetry.rightVoltage, LOOPED_VOLTAGE_MAX, LOOPED_VOLTAGE_STEP,
+                     directions[directionIndex++]);
+  loopedTelemetry.rightSoc =
+      loopFloatValue(loopedTelemetry.rightSoc, LOOPED_SOC_MAX, LOOPED_SOC_STEP,
+                     directions[directionIndex++]);
+  loopedTelemetry.rightCurrent =
+      loopFloatValue(loopedTelemetry.rightCurrent, LOOPED_CURRENT_MAX, LOOPED_CURRENT_STEP,
+                     directions[directionIndex++]);
+  loopedTelemetry.mpptTemperature = loopFloatValue(
+      loopedTelemetry.mpptTemperature, LOOPED_TEMPERATURE_MAX, LOOPED_TEMPERATURE_STEP,
+      directions[directionIndex++]);
+  loopedTelemetry.mpptPower =
+      loopFloatValue(loopedTelemetry.mpptPower, LOOPED_POWER_MAX, LOOPED_POWER_STEP,
+                     directions[directionIndex++]);
+  loopedTelemetry.centerGauge = static_cast<uint16_t>(
+      loopUnsignedValue(loopedTelemetry.centerGauge, LOOPED_CENTER_GAUGE_MAX,
+                        LOOPED_CENTER_GAUGE_STEP, directions[directionIndex++]));
 }
 
 void debugPrintHexByte(uint8_t value) {
@@ -1010,6 +1112,13 @@ void loop() {
   readNextion();
 
   uint32_t now = millis();
+  if (now - lastLoopedTelemetryUpdate >= LOOPED_TELEMETRY_INTERVAL_MS) {
+    lastLoopedTelemetryUpdate = now;
+    updateLoopedTelemetry();
+    publishLoopedTelemetry();
+  }
+
+  now = millis();
   if (now - lastPageHeartbeat >= PAGE_HEARTBEAT_INTERVAL_MS) {
     lastPageHeartbeat = now;
     nextionCommand("sendme");
