@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SoftwareSerial.h>
+#include <string.h>
 
 /*
   Teensy 4.1 <-> Nextion Intelligent NX8048P050-011C
@@ -10,11 +11,14 @@
   Wiring used by this sketch:
     Teensy 4.1 pin 2, software TX  -> Nextion RX
     Teensy 4.1 pin 3, software RX  <- Nextion TX
+    Teensy 4.1 pin 17, Serial4 TX  -> ANT BMS RX
+    Teensy 4.1 pin 16, Serial4 RX  <- ANT BMS TX
     GND                    -> Nextion GND
+    GND                    -> ANT BMS GND
     External 5 V supply    -> Nextion 5 V input
 
   Teensy 4.1 pins are 3.3 V and are not 5 V tolerant. If the Nextion TX line
-  outputs 5 V, level-shift it before connecting it to Teensy pin 3.
+  or BMS TX line outputs 5 V, level-shift it before connecting it to Teensy.
 
   The HMI uses page0 and xfloat numeric components. For xfloat fields with
   vvs1=1, write .val as value * 10. x1 has vvs1=0, so RPM is written directly.
@@ -45,8 +49,11 @@
 namespace {
 constexpr uint32_t DEBUG_BAUD = 115200;
 constexpr uint32_t NEXTION_BAUD = 9600;
+constexpr uint32_t BMS_BAUD = 19200;
 constexpr uint32_t TELEMETRY_INTERVAL_MS = 250;
 constexpr uint32_t PAGE_HEARTBEAT_INTERVAL_MS = 1000;
+constexpr uint32_t BMS_REQUEST_INTERVAL_MS = 1000;
+constexpr uint32_t BMS_READ_SLICE_MS = 20;
 constexpr float SPEED_MAX = 130.0f;
 constexpr float SPEED_STEP = 0.8f;
 constexpr uint32_t RPM_MAX = 1700;
@@ -65,10 +72,34 @@ constexpr uint32_t CENTER_GAUGE_MAX = 100;
 constexpr uint32_t CENTER_GAUGE_STEP = 2;
 constexpr uint8_t NEXTION_RX_PIN = 3;
 constexpr uint8_t NEXTION_TX_PIN = 2;
+constexpr uint8_t BMS_RX_PIN = 16;
+constexpr uint8_t BMS_TX_PIN = 17;
 constexpr uint8_t NEXTION_TERMINATOR = 0xFF;
 constexpr uint8_t PAGE0_ID = 0;
+constexpr uint8_t ANT_REQUEST_CMD[6] = {0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00};
+constexpr uint8_t ANT_HEADER[4] = {0xAA, 0x55, 0xAA, 0xFF};
+constexpr size_t ANT_FRAME_SIZE = 140;
+constexpr uint8_t ANT_CELL_COUNT = 32;
+constexpr uint8_t ANT_TEMP_COUNT = 6;
+constexpr float PACK_VOLTAGE_SCALE = 0.1f;
+constexpr float PACK_CURRENT_SCALE = 0.1f;
+constexpr float MILLIVOLTS_TO_VOLTS = 0.001f;
+constexpr float MICRO_AH_TO_AH = 0.000001f;
+
+// ANT BMS frame byte addresses imported from bms.cpp.
+constexpr size_t OFFSET_PACK_VOLTAGE = 4;
+constexpr size_t OFFSET_CELLS = 6;
+constexpr size_t OFFSET_PACK_CURRENT = 70;
+constexpr size_t OFFSET_SOC = 74;
+constexpr size_t OFFSET_CAP_TOTAL = 75;
+constexpr size_t OFFSET_CAP_REMAIN = 79;
+constexpr size_t OFFSET_CYCLES = 87;
+constexpr size_t OFFSET_TEMPS = 91;
+constexpr size_t OFFSET_MOS_CHARGE = 103;
+constexpr size_t OFFSET_MOS_DISCHARGE = 104;
 
 SoftwareSerial nextion(NEXTION_RX_PIN, NEXTION_TX_PIN);
+HardwareSerial &bmsSerial = Serial4;
 
 struct Telemetry {
   float speedKmh;
@@ -94,10 +125,36 @@ struct Telemetry {
   uint16_t centerGauge;
 };
 
+struct BmsTelemetry {
+  float packVoltage = 0.0f;
+  float packCurrent = 0.0f;
+  float soc = 0.0f;
+  float capTotalAh = 0.0f;
+  float capRemainAh = 0.0f;
+  uint16_t cycles = 0;
+  float temps[ANT_TEMP_COUNT] = {};
+  bool mosCharge = false;
+  bool mosDischarge = false;
+  float cells[ANT_CELL_COUNT] = {};
+  uint8_t activeCellCount = 0;
+  float minCell = 0.0f;
+  float maxCell = 0.0f;
+  float avgCell = 0.0f;
+  float deltaCell = 0.0f;
+  uint8_t minCellId = 0;
+  uint8_t maxCellId = 0;
+};
+
 Telemetry telemetry = {};
+BmsTelemetry bmsTelemetry = {};
 
 uint32_t lastTelemetryUpdate = 0;
 uint32_t lastPageHeartbeat = 0;
+uint32_t lastBmsRequest = 0;
+uint32_t lastBmsFrame = 0;
+uint8_t bmsRxBuffer[512] = {};
+size_t bmsRxLength = 0;
+bool hasBmsTelemetry = false;
 
 void sendTerminator() {
   nextion.write(NEXTION_TERMINATOR);
@@ -164,6 +221,200 @@ uint32_t loopUnsignedValue(uint32_t value, uint32_t maxValue, uint32_t step, int
   }
 
   return static_cast<uint32_t>(nextValue);
+}
+
+uint16_t readU16BE(const uint8_t *p) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+}
+
+int16_t readI16BE(const uint8_t *p) {
+  return static_cast<int16_t>(readU16BE(p));
+}
+
+uint32_t readU32BE(const uint8_t *p) {
+  return (static_cast<uint32_t>(p[0]) << 24) |
+         (static_cast<uint32_t>(p[1]) << 16) |
+         (static_cast<uint32_t>(p[2]) << 8) |
+         static_cast<uint32_t>(p[3]);
+}
+
+int32_t readI32BE(const uint8_t *p) {
+  return static_cast<int32_t>(readU32BE(p));
+}
+
+float absoluteFloat(float value) {
+  return value < 0.0f ? -value : value;
+}
+
+float convertMilliVoltsToVolts(uint16_t milliVolts) {
+  return static_cast<float>(milliVolts) * MILLIVOLTS_TO_VOLTS;
+}
+
+float convertTenthsToFloat(int32_t valueInTenths) {
+  return static_cast<float>(valueInTenths) * PACK_CURRENT_SCALE;
+}
+
+float convertMicroAhToAh(uint32_t microAh) {
+  return static_cast<float>(microAh) * MICRO_AH_TO_AH;
+}
+
+float computeAverageBmsTemperature(const BmsTelemetry &source) {
+  float sum = 0.0f;
+  for (uint8_t i = 0; i < ANT_TEMP_COUNT; ++i) {
+    sum += source.temps[i];
+  }
+
+  return sum / static_cast<float>(ANT_TEMP_COUNT);
+}
+
+void applyBmsTelemetryToDisplay() {
+  telemetry.bmsVoltage = bmsTelemetry.packVoltage;
+  telemetry.bmsCurrent = absoluteFloat(bmsTelemetry.packCurrent);
+  telemetry.bmsPower = absoluteFloat(bmsTelemetry.packVoltage * bmsTelemetry.packCurrent);
+  telemetry.bmsTemperature = computeAverageBmsTemperature(bmsTelemetry);
+}
+
+int findBmsHeader(const uint8_t *data, size_t length) {
+  if (length < sizeof(ANT_HEADER)) {
+    return -1;
+  }
+
+  for (size_t i = 0; i <= length - sizeof(ANT_HEADER); ++i) {
+    if (data[i] == ANT_HEADER[0] && data[i + 1] == ANT_HEADER[1] &&
+        data[i + 2] == ANT_HEADER[2] && data[i + 3] == ANT_HEADER[3]) {
+      return static_cast<int>(i);
+    }
+  }
+
+  return -1;
+}
+
+void parseBmsCellBlock(const uint8_t *frame, BmsTelemetry &target) {
+  float cellSum = 0.0f;
+  bool hasMinMax = false;
+
+  for (uint8_t i = 0; i < ANT_CELL_COUNT; ++i) {
+    const size_t offset = OFFSET_CELLS + (i * 2);
+    const uint16_t cellMilliVolts = readU16BE(&frame[offset]);
+    if (cellMilliVolts == 0) {
+      continue;
+    }
+
+    target.cells[i] = convertMilliVoltsToVolts(cellMilliVolts);
+    target.activeCellCount++;
+    cellSum += target.cells[i];
+
+    if (!hasMinMax || target.cells[i] < target.minCell) {
+      target.minCell = target.cells[i];
+      target.minCellId = i + 1;
+    }
+    if (!hasMinMax || target.cells[i] > target.maxCell) {
+      target.maxCell = target.cells[i];
+      target.maxCellId = i + 1;
+    }
+
+    hasMinMax = true;
+  }
+
+  if (target.activeCellCount > 0) {
+    target.avgCell = cellSum / static_cast<float>(target.activeCellCount);
+    target.deltaCell = target.maxCell - target.minCell;
+  }
+}
+
+void parseBmsTemperatureBlock(const uint8_t *frame, BmsTelemetry &target) {
+  for (uint8_t i = 0; i < ANT_TEMP_COUNT; ++i) {
+    const size_t offset = OFFSET_TEMPS + (i * 2);
+    target.temps[i] = static_cast<float>(readI16BE(&frame[offset]));
+  }
+}
+
+void parseBmsFrame(const uint8_t *frame) {
+  BmsTelemetry parsed;
+
+  parsed.packVoltage =
+      static_cast<float>(readU16BE(&frame[OFFSET_PACK_VOLTAGE])) * PACK_VOLTAGE_SCALE;
+  parseBmsCellBlock(frame, parsed);
+  parsed.packCurrent = convertTenthsToFloat(readI32BE(&frame[OFFSET_PACK_CURRENT]));
+  parsed.soc = static_cast<float>(frame[OFFSET_SOC]);
+  parsed.capTotalAh = convertMicroAhToAh(readU32BE(&frame[OFFSET_CAP_TOTAL]));
+  parsed.capRemainAh = convertMicroAhToAh(readU32BE(&frame[OFFSET_CAP_REMAIN]));
+  parsed.cycles = readU16BE(&frame[OFFSET_CYCLES]);
+  parseBmsTemperatureBlock(frame, parsed);
+  parsed.mosCharge = frame[OFFSET_MOS_CHARGE] != 0;
+  parsed.mosDischarge = frame[OFFSET_MOS_DISCHARGE] != 0;
+
+  bmsTelemetry = parsed;
+  hasBmsTelemetry = true;
+  lastBmsFrame = millis();
+  applyBmsTelemetryToDisplay();
+}
+
+void compactBmsRxBuffer(size_t start, size_t count) {
+  const size_t end = start + count;
+  if (end >= bmsRxLength) {
+    bmsRxLength = 0;
+    return;
+  }
+
+  const size_t remaining = bmsRxLength - end;
+  memmove(bmsRxBuffer, bmsRxBuffer + end, remaining);
+  bmsRxLength = remaining;
+}
+
+void processBmsRxBuffer() {
+  while (true) {
+    const int headerIndex = findBmsHeader(bmsRxBuffer, bmsRxLength);
+    if (headerIndex < 0) {
+      if (bmsRxLength > (ANT_FRAME_SIZE * 2)) {
+        bmsRxLength = 0;
+      }
+      return;
+    }
+
+    if (headerIndex > 0) {
+      compactBmsRxBuffer(0, static_cast<size_t>(headerIndex));
+      continue;
+    }
+
+    if (bmsRxLength < ANT_FRAME_SIZE) {
+      return;
+    }
+
+    parseBmsFrame(bmsRxBuffer);
+    compactBmsRxBuffer(0, ANT_FRAME_SIZE);
+  }
+}
+
+void pollBmsUart() {
+  const uint32_t start = millis();
+
+  while (millis() - start < BMS_READ_SLICE_MS) {
+    while (bmsSerial.available() > 0) {
+      const int value = bmsSerial.read();
+      if (value < 0) {
+        break;
+      }
+
+      if (bmsRxLength < sizeof(bmsRxBuffer)) {
+        bmsRxBuffer[bmsRxLength++] = static_cast<uint8_t>(value);
+      } else {
+        bmsRxLength = 0;
+      }
+    }
+
+    processBmsRxBuffer();
+    delay(1);
+  }
+}
+
+void sendBmsRequestIfNeeded() {
+  const uint32_t now = millis();
+  if (now - lastBmsRequest >= BMS_REQUEST_INTERVAL_MS) {
+    bmsSerial.write(ANT_REQUEST_CMD, sizeof(ANT_REQUEST_CMD));
+    bmsSerial.flush();
+    lastBmsRequest = now;
+  }
 }
 
 void changePage(const char *pageName) {
@@ -312,15 +563,6 @@ void simulateTelemetry() {
   telemetry.mpptPower = loopFloatValue(telemetry.mpptPower, POWER_MAX, POWER_STEP,
                                        directions[directionIndex++]);
 
-  telemetry.bmsVoltage = loopFloatValue(telemetry.bmsVoltage, VOLTAGE_MAX, VOLTAGE_STEP,
-                                        directions[directionIndex++]);
-  telemetry.bmsCurrent = loopFloatValue(telemetry.bmsCurrent, CURRENT_MAX, CURRENT_STEP,
-                                        directions[directionIndex++]);
-  telemetry.bmsPower = loopFloatValue(telemetry.bmsPower, POWER_MAX, POWER_STEP,
-                                      directions[directionIndex++]);
-  telemetry.bmsTemperature = loopFloatValue(telemetry.bmsTemperature, TEMPERATURE_MAX,
-                                            TEMPERATURE_STEP, directions[directionIndex++]);
-
   telemetry.centerGauge = static_cast<uint16_t>(loopUnsignedValue(
       telemetry.centerGauge, CENTER_GAUGE_MAX, CENTER_GAUGE_STEP, directions[directionIndex++]));
 }
@@ -461,15 +703,24 @@ void setup() {
 
   Serial.begin(DEBUG_BAUD);
   nextion.begin(NEXTION_BAUD);
+  bmsSerial.begin(BMS_BAUD);
 
   initialiseNextion();
 
   Serial.println("Teensy 4.1 Nextion page0 interface ready");
+  Serial.print("ANT BMS reader on Serial4 RX=");
+  Serial.print(BMS_RX_PIN);
+  Serial.print(" TX=");
+  Serial.print(BMS_TX_PIN);
+  Serial.print(" baud=");
+  Serial.println(BMS_BAUD);
 }
 
 void loop() {
   const uint32_t now = millis();
 
+  sendBmsRequestIfNeeded();
+  pollBmsUart();
   readNextion();
 
   if (now - lastTelemetryUpdate >= TELEMETRY_INTERVAL_MS) {
