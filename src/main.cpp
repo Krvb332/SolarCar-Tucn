@@ -1,5 +1,9 @@
 #include <Arduino.h>
+#if defined(ESP32)
+#include "driver/twai.h"
+#else
 #include <SoftwareSerial.h>
+#endif
 #include <string.h>
 
 /*
@@ -34,15 +38,18 @@
     x4    id=14  BMS Volt, 1 decimal         t3  id=8  "Volt"
     x5    id=15  BMS Amp, 1 decimal          t4  id=9  "Amp"
     x6    id=16  BMS Pow, 1 decimal          t5  id=10 "Pow"
-    x11   id=22  right Volt, 1 decimal       t11 id=21 "Volt"
-    x10   id=20  right SOC, 1 decimal        t10 id=19 "SOC"
-    x9    id=18  right Amp, 1 decimal        t9  id=17 "Amp"
+    x11   id=22  MPPT Volt, 1 decimal        t11 id=21 "Volt"
+    x10   id=20  secondary Volt, 1 decimal   t10 id=19 "Volt2"
+    x9    id=18  MPPT Amp, 1 decimal         t9  id=17 "Amp"
     x7    id=24  MPPT Temp, 1 decimal        t12 id=25 "Temp"
     x8    id=26  MPPT Pow, 1 decimal         t8  id=27 "Pow"
-    x12   id=30  BMS Volt, 1 decimal         t14 id=29 "Volt"
-    x13   id=32  BMS Amp, 1 decimal          t15 id=31 "Amp"
-    x14   id=34  BMS Pow, 1 decimal          t16 id=33 "Pow"
-    x15   id=35  BMS Tmp, 1 decimal          t17 id=36 "Tmp"
+    x12   id=30  drive voltage, 1 decimal
+    x13   id=32  drive current, 1 decimal
+    x14   id=34  drive power, 1 decimal
+    x15   id=35  drive temperature, 1 decimal
+    x16          TPMS front-left pressure
+    x17          TPMS front-right pressure
+    x18          TPMS middle wheel pressure
     z0    id=37  center gauge/progress value
 */
 
@@ -55,31 +62,58 @@ constexpr uint32_t PAGE_HEARTBEAT_INTERVAL_MS = 1000;
 constexpr uint32_t BMS_REQUEST_INTERVAL_MS = 1000;
 constexpr uint32_t BMS_RESPONSE_WINDOW_MS = 1000;
 constexpr uint32_t BMS_STALE_LOG_INTERVAL_MS = 3000;
+constexpr uint32_t TPMS_SENSOR_TIMEOUT_MS = 2000;
 constexpr bool ENABLE_BMS_SERIAL_DEBUG = true;
 constexpr bool BMS_DEBUG_PRINT_RAW_FRAME = true;
 constexpr size_t BMS_DEBUG_RAW_BYTES_PER_LINE = 16;
-constexpr float LOOPED_SPEED_MAX = 130.0f;
+constexpr float LOOPED_BMS_SOC_MIN = 1.0f;
+constexpr float LOOPED_BMS_SOC_MAX = 100.0f;
+constexpr float LOOPED_BMS_SOC_STEP = 1.0f;
+constexpr float LOOPED_BMS_VOLTAGE_MAX = 150.0f;
+constexpr float LOOPED_BMS_VOLTAGE_STEP = 0.8f;
+constexpr float LOOPED_BMS_CURRENT_MAX = 100.0f;
+constexpr float LOOPED_BMS_CURRENT_STEP = 0.6f;
+constexpr float LOOPED_BMS_POWER_MAX = 3000.0f;
+constexpr float LOOPED_BMS_POWER_STEP = 35.0f;
+constexpr float LOOPED_BMS_TEMPERATURE_MAX = 100.0f;
+constexpr float LOOPED_BMS_TEMPERATURE_STEP = 0.5f;
+constexpr float LOOPED_MPPT_VOLTAGE_MAX = 150.0f;
+constexpr float LOOPED_MPPT_VOLTAGE_STEP = 0.7f;
+constexpr float LOOPED_MPPT_CURRENT_MAX = 50.0f;
+constexpr float LOOPED_MPPT_CURRENT_STEP = 0.4f;
+constexpr float LOOPED_MPPT_POWER_MAX = 2000.0f;
+constexpr float LOOPED_MPPT_POWER_STEP = 25.0f;
+constexpr float LOOPED_MPPT_TEMPERATURE_MAX = 100.0f;
+constexpr float LOOPED_MPPT_TEMPERATURE_STEP = 0.5f;
+constexpr float LOOPED_SECONDARY_VOLTAGE_MAX = 50.0f;
+constexpr float LOOPED_SECONDARY_VOLTAGE_STEP = 0.4f;
+constexpr float LOOPED_SPEED_MAX = 150.0f;
 constexpr float LOOPED_SPEED_STEP = 0.8f;
-constexpr uint32_t LOOPED_RPM_MAX = 1700;
+constexpr uint32_t LOOPED_RPM_MAX = 2000;
 constexpr uint32_t LOOPED_RPM_STEP = 50;
-constexpr float LOOPED_TEMPERATURE_MAX = 100.0f;
-constexpr float LOOPED_TEMPERATURE_STEP = 0.7f;
-constexpr float LOOPED_SOC_MAX = 100.0f;
-constexpr float LOOPED_SOC_STEP = 1.0f;
-constexpr float LOOPED_VOLTAGE_MAX = 60.0f;
-constexpr float LOOPED_VOLTAGE_STEP = 0.5f;
-constexpr float LOOPED_CURRENT_MAX = 30.0f;
-constexpr float LOOPED_CURRENT_STEP = 0.4f;
-constexpr float LOOPED_POWER_MAX = 1800.0f;
-constexpr float LOOPED_POWER_STEP = 25.0f;
+constexpr float LOOPED_DRIVE_POWER_MAX = 3000.0f;
+constexpr float LOOPED_DRIVE_POWER_STEP = 35.0f;
+constexpr float LOOPED_DRIVE_VOLTAGE_MAX = 150.0f;
+constexpr float LOOPED_DRIVE_VOLTAGE_STEP = 0.8f;
+constexpr float LOOPED_DRIVE_CURRENT_MAX = 100.0f;
+constexpr float LOOPED_DRIVE_CURRENT_STEP = 0.6f;
+constexpr float LOOPED_DRIVE_TEMPERATURE_MAX = 100.0f;
+constexpr float LOOPED_DRIVE_TEMPERATURE_STEP = 0.5f;
+constexpr float LOOPED_TPMS_PRESSURE_MAX = 3.0f;
+constexpr float LOOPED_TPMS_PRESSURE_STEP = 0.03f;
 constexpr uint32_t LOOPED_CENTER_GAUGE_MAX = 100;
 constexpr uint32_t LOOPED_CENTER_GAUGE_STEP = 2;
 constexpr uint8_t NEXTION_RX_PIN = 3;
 constexpr uint8_t NEXTION_TX_PIN = 2;
 constexpr uint8_t BMS_RX_PIN = 11;
 constexpr uint8_t BMS_TX_PIN = 12;
+#if defined(ESP32)
+constexpr gpio_num_t TPMS_CAN_TX_PIN = GPIO_NUM_5;
+constexpr gpio_num_t TPMS_CAN_RX_PIN = GPIO_NUM_4;
+#endif
 constexpr uint8_t NEXTION_TERMINATOR = 0xFF;
 constexpr uint8_t PAGE0_ID = 0;
+constexpr uint32_t TPMS_CAN_MESSAGE_ID = 0x18FEF433;
 constexpr uint8_t ANT_REQUEST_CMD[6] = {0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00};
 constexpr uint8_t ANT_HEADER[4] = {0xAA, 0x55, 0xAA, 0xFF};
 constexpr size_t ANT_FRAME_SIZE = 140;
@@ -109,8 +143,13 @@ static_assert(OFFSET_TEMPS + (ANT_TEMP_COUNT * 2) <= ANT_FRAME_SIZE,
 static_assert(OFFSET_MOS_DISCHARGE < ANT_FRAME_SIZE,
               "BMS MOS status offsets must fit inside the ANT frame");
 
+#if defined(ESP32)
+HardwareSerial nextion(1);
+HardwareSerial bmsSerial(2);
+#else
 SoftwareSerial nextion(NEXTION_RX_PIN, NEXTION_TX_PIN);
 SoftwareSerial bmsSerial(BMS_RX_PIN, BMS_TX_PIN);
+#endif
 
 struct BmsTelemetry {
   float packVoltage = 0.0f;
@@ -133,18 +172,40 @@ struct BmsTelemetry {
 };
 
 struct LoopedTelemetry {
+  float bmsSoc = LOOPED_BMS_SOC_MIN;
+  float bmsVoltage = 0.0f;
+  float bmsCurrent = 0.0f;
+  float bmsPower = 0.0f;
+  float bmsTemperature = 0.0f;
+  float mpptVoltage = 0.0f;
+  float mpptCurrent = 0.0f;
+  float mpptPower = 0.0f;
+  float mpptTemperature = 0.0f;
+  float secondaryVoltage = 0.0f;
   float speedKmh = 0.0f;
   uint32_t motorRpm = 0;
-  float rightVoltage = 0.0f;
-  float rightSoc = 0.0f;
-  float rightCurrent = 0.0f;
-  float mpptTemperature = 0.0f;
-  float mpptPower = 0.0f;
+  float drivePower = 0.0f;
+  float driveVoltage = 0.0f;
+  float driveCurrent = 0.0f;
+  float driveTemperature = 0.0f;
+  float tpmsFrontLeft = 0.0f;
+  float tpmsFrontRight = 0.0f;
+  float tpmsMiddle = 0.0f;
   uint16_t centerGauge = 0;
+};
+
+struct TpmsWheel {
+  float pressureBar = 0.0f;
+  int temperatureC = 0;
+  float batteryV = 0.0f;
+  bool leakingAir = false;
+  bool extremeTemperature = false;
+  uint32_t lastMessageMs = 0;
 };
 
 BmsTelemetry bmsTelemetry = {};
 LoopedTelemetry loopedTelemetry = {};
+TpmsWheel tpmsWheels[5] = {};
 
 uint32_t lastLoopedTelemetryUpdate = 0;
 uint32_t lastPageHeartbeat = 0;
@@ -162,6 +223,7 @@ uint8_t bmsRxBuffer[512] = {};
 size_t bmsRxLength = 0;
 bool hasBmsTelemetry = false;
 bool awaitingBmsResponse = false;
+bool tpmsCanReady = false;
 
 enum class ActiveSoftwarePort {
   None,
@@ -181,6 +243,8 @@ NextionCachedValue nextionValueCache[] = {
     {"x0", 0, false},  {"x1", 0, false},  {"x2", 0, false},  {"x3", 0, false},
     {"x4", 0, false},  {"x5", 0, false},  {"x6", 0, false},  {"x7", 0, false},
     {"x8", 0, false},  {"x9", 0, false},  {"x10", 0, false}, {"x11", 0, false},
+    {"x12", 0, false}, {"x13", 0, false}, {"x14", 0, false}, {"x15", 0, false},
+    {"x16", 0, false}, {"x17", 0, false}, {"x18", 0, false},
     {"z0", 0, false},
 };
 
@@ -193,7 +257,11 @@ void activateNextionPort() {
     bmsSerial.end();
   }
 
+#if defined(ESP32)
+  nextion.begin(NEXTION_BAUD, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
+#else
   nextion.begin(NEXTION_BAUD);
+#endif
   activeSoftwarePort = ActiveSoftwarePort::Nextion;
 }
 
@@ -206,7 +274,11 @@ void activateBmsPort() {
     nextion.end();
   }
 
+#if defined(ESP32)
+  bmsSerial.begin(BMS_BAUD, SERIAL_8N1, BMS_RX_PIN, BMS_TX_PIN);
+#else
   bmsSerial.begin(BMS_BAUD);
+#endif
   activeSoftwarePort = ActiveSoftwarePort::Bms;
 }
 
@@ -280,13 +352,14 @@ void setXFloatFromBms(const char *component, float value, uint8_t decimals) {
   setValue(component, scaledValue(value, decimals));
 }
 
-float loopFloatValue(float value, float maxValue, float step, int8_t &direction) {
+float loopFloatValue(float value, float maxValue, float step, int8_t &direction,
+                     float minValue = 0.0f) {
   value += step * static_cast<float>(direction);
   if (value >= maxValue) {
     value = maxValue;
     direction = -1;
-  } else if (value <= 0.0f) {
-    value = 0.0f;
+  } else if (value <= minValue) {
+    value = minValue;
     direction = 1;
   }
 
@@ -363,27 +436,14 @@ void publishBmsTelemetry() {
   setXFloatFromBms("x5", packCurrent, 1);
   setXFloatFromBms("x6", packPower, 1);
   setXFloatFromBms("x2", averageTemperature, 1);
-
-  setXFloatFromBms("x12", bmsTelemetry.packVoltage, 1);
-  setXFloatFromBms("x13", packCurrent, 1);
-  setXFloatFromBms("x14", packPower, 1);
-  setXFloatFromBms("x15", averageTemperature, 1);
 }
 
 void publishSimulatedBmsTelemetry() {
-  const float packCurrent = absoluteFloat(loopedTelemetry.rightCurrent);
-  const float packPower = absoluteFloat(loopedTelemetry.rightVoltage * loopedTelemetry.rightCurrent);
-
-  setXFloatFromBms("x3", loopedTelemetry.rightSoc, 1);
-  setXFloatFromBms("x4", loopedTelemetry.rightVoltage, 1);
-  setXFloatFromBms("x5", packCurrent, 1);
-  setXFloatFromBms("x6", packPower, 1);
-  setXFloatFromBms("x2", loopedTelemetry.mpptTemperature, 1);
-
-  setXFloatFromBms("x12", loopedTelemetry.rightVoltage, 1);
-  setXFloatFromBms("x13", packCurrent, 1);
-  setXFloatFromBms("x14", packPower, 1);
-  setXFloatFromBms("x15", loopedTelemetry.mpptTemperature, 1);
+  setXFloatFromBms("x3", loopedTelemetry.bmsSoc, 1);
+  setXFloatFromBms("x4", loopedTelemetry.bmsVoltage, 1);
+  setXFloatFromBms("x5", loopedTelemetry.bmsCurrent, 1);
+  setXFloatFromBms("x6", loopedTelemetry.bmsPower, 1);
+  setXFloatFromBms("x2", loopedTelemetry.bmsTemperature, 1);
 }
 
 bool hasFreshBmsTelemetry(uint32_t now) {
@@ -402,40 +462,158 @@ void publishLoopedTelemetry() {
   setXFloatIfChanged("x0", loopedTelemetry.speedKmh, 1);
   setValueIfChanged("x1", static_cast<int32_t>(loopedTelemetry.motorRpm));
 
-  setXFloatIfChanged("x11", loopedTelemetry.rightVoltage, 1);
-  setXFloatIfChanged("x10", loopedTelemetry.rightSoc, 1);
-  setXFloatIfChanged("x9", loopedTelemetry.rightCurrent, 1);
+  setXFloatIfChanged("x11", loopedTelemetry.mpptVoltage, 1);
+  setXFloatIfChanged("x10", loopedTelemetry.secondaryVoltage, 1);
+  setXFloatIfChanged("x9", loopedTelemetry.mpptCurrent, 1);
   setXFloatIfChanged("x7", loopedTelemetry.mpptTemperature, 1);
   setXFloatIfChanged("x8", loopedTelemetry.mpptPower, 1);
+
+  setXFloatIfChanged("x12", loopedTelemetry.driveVoltage, 1);
+  setXFloatIfChanged("x13", loopedTelemetry.driveCurrent, 1);
+  setXFloatIfChanged("x14", loopedTelemetry.drivePower, 1);
+  setXFloatIfChanged("x15", loopedTelemetry.driveTemperature, 1);
 
   setValueIfChanged("z0", loopedTelemetry.centerGauge);
 }
 
+bool hasFreshTpmsWheel(uint8_t wheelId, uint32_t now) {
+  return tpmsWheels[wheelId].lastMessageMs != 0 &&
+         (now - tpmsWheels[wheelId].lastMessageMs <= TPMS_SENSOR_TIMEOUT_MS);
+}
+
+void publishTpmsDisplay(uint32_t now) {
+  const char *const pressureComponents[5] = {"", "x16", "x17", "x18", nullptr};
+  const float simulatedPressures[5] = {
+      0.0f,
+      loopedTelemetry.tpmsFrontLeft,
+      loopedTelemetry.tpmsFrontRight,
+      loopedTelemetry.tpmsMiddle,
+      0.0f,
+  };
+
+  for (uint8_t wheelId = 1; wheelId <= 4; ++wheelId) {
+    if (pressureComponents[wheelId] == nullptr) {
+      continue;
+    }
+
+    const float pressure =
+        hasFreshTpmsWheel(wheelId, now) ? tpmsWheels[wheelId].pressureBar
+                                        : simulatedPressures[wheelId];
+    setXFloatIfChanged(pressureComponents[wheelId], pressure, 1);
+  }
+}
+
+void initialiseTpmsCan() {
+#if defined(ESP32)
+  twai_general_config_t generalConfig =
+      TWAI_GENERAL_CONFIG_DEFAULT(TPMS_CAN_TX_PIN, TPMS_CAN_RX_PIN, TWAI_MODE_NORMAL);
+  twai_timing_config_t timingConfig = TWAI_TIMING_CONFIG_500KBITS();
+  twai_filter_config_t filterConfig = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+  tpmsCanReady =
+      twai_driver_install(&generalConfig, &timingConfig, &filterConfig) == ESP_OK &&
+      twai_start() == ESP_OK;
+
+  Serial.println(tpmsCanReady ? "TPMS CAN started." : "TPMS CAN failed to start.");
+#else
+  tpmsCanReady = false;
+  Serial.println("TPMS TWAI is available only on ESP32 builds.");
+#endif
+}
+
+void pollTpmsCan() {
+#if defined(ESP32)
+  if (!tpmsCanReady) {
+    return;
+  }
+
+  twai_message_t message;
+  while (twai_receive(&message, 0) == ESP_OK) {
+    if (message.identifier != TPMS_CAN_MESSAGE_ID || message.data_length_code < 6) {
+      continue;
+    }
+
+    const uint8_t wheelId = message.data[0];
+    if (wheelId < 1 || wheelId > 4) {
+      continue;
+    }
+
+    const int rawPressure = (static_cast<int>(message.data[1]) << 8) | message.data[2];
+    TpmsWheel &wheel = tpmsWheels[wheelId];
+    wheel.pressureBar = (static_cast<float>(rawPressure) * 0.0101f) + 0.35f;
+    wheel.temperatureC = message.data[3];
+    wheel.batteryV = static_cast<float>(message.data[4]) * 0.1237f;
+    wheel.leakingAir = bitRead(message.data[5], 0);
+    wheel.extremeTemperature = bitRead(message.data[5], 4);
+    wheel.lastMessageMs = millis();
+  }
+#endif
+}
+
 void updateLoopedTelemetry() {
-  static int8_t directions[] = {1, 1, 1, 1, 1, 1, 1, 1};
+  static int8_t directions[] = {
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+  };
   uint8_t directionIndex = 0;
 
+  loopedTelemetry.bmsSoc =
+      loopFloatValue(loopedTelemetry.bmsSoc, LOOPED_BMS_SOC_MAX, LOOPED_BMS_SOC_STEP,
+                     directions[directionIndex++], LOOPED_BMS_SOC_MIN);
+  loopedTelemetry.bmsVoltage =
+      loopFloatValue(loopedTelemetry.bmsVoltage, LOOPED_BMS_VOLTAGE_MAX,
+                     LOOPED_BMS_VOLTAGE_STEP, directions[directionIndex++]);
+  loopedTelemetry.bmsCurrent =
+      loopFloatValue(loopedTelemetry.bmsCurrent, LOOPED_BMS_CURRENT_MAX,
+                     LOOPED_BMS_CURRENT_STEP, directions[directionIndex++]);
+  loopedTelemetry.bmsPower =
+      loopFloatValue(loopedTelemetry.bmsPower, LOOPED_BMS_POWER_MAX, LOOPED_BMS_POWER_STEP,
+                     directions[directionIndex++]);
+  loopedTelemetry.bmsTemperature = loopFloatValue(
+      loopedTelemetry.bmsTemperature, LOOPED_BMS_TEMPERATURE_MAX,
+      LOOPED_BMS_TEMPERATURE_STEP, directions[directionIndex++]);
+  loopedTelemetry.mpptVoltage =
+      loopFloatValue(loopedTelemetry.mpptVoltage, LOOPED_MPPT_VOLTAGE_MAX,
+                     LOOPED_MPPT_VOLTAGE_STEP, directions[directionIndex++]);
+  loopedTelemetry.mpptCurrent =
+      loopFloatValue(loopedTelemetry.mpptCurrent, LOOPED_MPPT_CURRENT_MAX,
+                     LOOPED_MPPT_CURRENT_STEP, directions[directionIndex++]);
+  loopedTelemetry.mpptPower =
+      loopFloatValue(loopedTelemetry.mpptPower, LOOPED_MPPT_POWER_MAX,
+                     LOOPED_MPPT_POWER_STEP, directions[directionIndex++]);
+  loopedTelemetry.mpptTemperature = loopFloatValue(
+      loopedTelemetry.mpptTemperature, LOOPED_MPPT_TEMPERATURE_MAX,
+      LOOPED_MPPT_TEMPERATURE_STEP, directions[directionIndex++]);
+  loopedTelemetry.secondaryVoltage = loopFloatValue(
+      loopedTelemetry.secondaryVoltage, LOOPED_SECONDARY_VOLTAGE_MAX,
+      LOOPED_SECONDARY_VOLTAGE_STEP, directions[directionIndex++]);
   loopedTelemetry.speedKmh =
       loopFloatValue(loopedTelemetry.speedKmh, LOOPED_SPEED_MAX, LOOPED_SPEED_STEP,
                      directions[directionIndex++]);
   loopedTelemetry.motorRpm =
       loopUnsignedValue(loopedTelemetry.motorRpm, LOOPED_RPM_MAX, LOOPED_RPM_STEP,
                         directions[directionIndex++]);
-  loopedTelemetry.rightVoltage =
-      loopFloatValue(loopedTelemetry.rightVoltage, LOOPED_VOLTAGE_MAX, LOOPED_VOLTAGE_STEP,
-                     directions[directionIndex++]);
-  loopedTelemetry.rightSoc =
-      loopFloatValue(loopedTelemetry.rightSoc, LOOPED_SOC_MAX, LOOPED_SOC_STEP,
-                     directions[directionIndex++]);
-  loopedTelemetry.rightCurrent =
-      loopFloatValue(loopedTelemetry.rightCurrent, LOOPED_CURRENT_MAX, LOOPED_CURRENT_STEP,
-                     directions[directionIndex++]);
-  loopedTelemetry.mpptTemperature = loopFloatValue(
-      loopedTelemetry.mpptTemperature, LOOPED_TEMPERATURE_MAX, LOOPED_TEMPERATURE_STEP,
-      directions[directionIndex++]);
-  loopedTelemetry.mpptPower =
-      loopFloatValue(loopedTelemetry.mpptPower, LOOPED_POWER_MAX, LOOPED_POWER_STEP,
-                     directions[directionIndex++]);
+  loopedTelemetry.drivePower =
+      loopFloatValue(loopedTelemetry.drivePower, LOOPED_DRIVE_POWER_MAX,
+                     LOOPED_DRIVE_POWER_STEP, directions[directionIndex++]);
+  loopedTelemetry.driveVoltage =
+      loopFloatValue(loopedTelemetry.driveVoltage, LOOPED_DRIVE_VOLTAGE_MAX,
+                     LOOPED_DRIVE_VOLTAGE_STEP, directions[directionIndex++]);
+  loopedTelemetry.driveCurrent =
+      loopFloatValue(loopedTelemetry.driveCurrent, LOOPED_DRIVE_CURRENT_MAX,
+                     LOOPED_DRIVE_CURRENT_STEP, directions[directionIndex++]);
+  loopedTelemetry.driveTemperature = loopFloatValue(
+      loopedTelemetry.driveTemperature, LOOPED_DRIVE_TEMPERATURE_MAX,
+      LOOPED_DRIVE_TEMPERATURE_STEP, directions[directionIndex++]);
+  loopedTelemetry.tpmsFrontLeft =
+      loopFloatValue(loopedTelemetry.tpmsFrontLeft, LOOPED_TPMS_PRESSURE_MAX,
+                     LOOPED_TPMS_PRESSURE_STEP, directions[directionIndex++]);
+  loopedTelemetry.tpmsFrontRight =
+      loopFloatValue(loopedTelemetry.tpmsFrontRight, LOOPED_TPMS_PRESSURE_MAX,
+                     LOOPED_TPMS_PRESSURE_STEP, directions[directionIndex++]);
+  loopedTelemetry.tpmsMiddle =
+      loopFloatValue(loopedTelemetry.tpmsMiddle, LOOPED_TPMS_PRESSURE_MAX,
+                     LOOPED_TPMS_PRESSURE_STEP, directions[directionIndex++]);
   loopedTelemetry.centerGauge = static_cast<uint16_t>(
       loopUnsignedValue(loopedTelemetry.centerGauge, LOOPED_CENTER_GAUGE_MAX,
                         LOOPED_CENTER_GAUGE_STEP, directions[directionIndex++]));
@@ -874,17 +1052,17 @@ const char *componentName(uint8_t componentId) {
     case 16:
       return "x6_bms_pow";
     case 17:
-      return "t9_right_amp";
+      return "t9_mppt_amp";
     case 18:
-      return "x9_right_amp";
+      return "x9_mppt_amp";
     case 19:
-      return "t10_right_soc";
+      return "t10_secondary_volt";
     case 20:
-      return "x10_right_soc";
+      return "x10_secondary_volt";
     case 21:
-      return "t11_right_volt";
+      return "t11_mppt_volt";
     case 22:
-      return "x11_right_volt";
+      return "x11_mppt_volt";
     case 23:
       return "t7_mppt";
     case 24:
@@ -898,21 +1076,21 @@ const char *componentName(uint8_t componentId) {
     case 28:
       return "t13_bms";
     case 29:
-      return "t14_bms_volt";
+      return "t14_drive_volt";
     case 30:
-      return "x12_bms_volt";
+      return "x12_drive_volt";
     case 31:
-      return "t15_bms_amp";
+      return "t15_drive_amp";
     case 32:
-      return "x13_bms_amp";
+      return "x13_drive_amp";
     case 33:
-      return "t16_bms_pow";
+      return "t16_drive_pow";
     case 34:
-      return "x14_bms_pow";
+      return "x14_drive_pow";
     case 35:
-      return "x15_bms_tmp";
+      return "x15_drive_temp";
     case 36:
-      return "t17_bms_tmp";
+      return "t17_drive_temp";
     case 37:
       return "z0_center_gauge";
     default:
@@ -940,6 +1118,9 @@ void clearDisplayValues() {
   setXFloatFromBms("x13", 0.0f, 1);
   setXFloatFromBms("x14", 0.0f, 1);
   setXFloatFromBms("x15", 0.0f, 1);
+  setXFloatIfChanged("x16", 0.0f, 1);
+  setXFloatIfChanged("x17", 0.0f, 1);
+  setXFloatIfChanged("x18", 0.0f, 1);
 
   setValueIfChanged("z0", 0);
 }
@@ -1114,6 +1295,7 @@ void setup() {
   Serial.begin(DEBUG_BAUD);
 
   initialiseNextion();
+  initialiseTpmsCan();
 
   Serial.println("Teensy 4.1 Nextion page0 interface ready");
   Serial.print("ANT BMS reader on software serial RX=");
@@ -1128,6 +1310,7 @@ void setup() {
 }
 
 void loop() {
+  pollTpmsCan();
   sendBmsRequestIfNeeded();
 
   if (isBmsResponseWindowActive(millis())) {
@@ -1145,6 +1328,7 @@ void loop() {
     updateLoopedTelemetry();
     publishLoopedTelemetry();
     publishBmsDisplay(now);
+    publishTpmsDisplay(now);
   }
 
   now = millis();
