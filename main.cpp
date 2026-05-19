@@ -370,6 +370,34 @@ void publishBmsTelemetry() {
   setXFloatFromBms("x15", averageTemperature, 1);
 }
 
+void publishSimulatedBmsTelemetry() {
+  const float packCurrent = absoluteFloat(loopedTelemetry.rightCurrent);
+  const float packPower = absoluteFloat(loopedTelemetry.rightVoltage * loopedTelemetry.rightCurrent);
+
+  setXFloatFromBms("x3", loopedTelemetry.rightSoc, 1);
+  setXFloatFromBms("x4", loopedTelemetry.rightVoltage, 1);
+  setXFloatFromBms("x5", packCurrent, 1);
+  setXFloatFromBms("x6", packPower, 1);
+  setXFloatFromBms("x2", loopedTelemetry.mpptTemperature, 1);
+
+  setXFloatFromBms("x12", loopedTelemetry.rightVoltage, 1);
+  setXFloatFromBms("x13", packCurrent, 1);
+  setXFloatFromBms("x14", packPower, 1);
+  setXFloatFromBms("x15", loopedTelemetry.mpptTemperature, 1);
+}
+
+bool hasFreshBmsTelemetry(uint32_t now) {
+  return hasBmsTelemetry && (now - lastBmsFrame < BMS_STALE_LOG_INTERVAL_MS);
+}
+
+void publishBmsDisplay(uint32_t now) {
+  if (hasFreshBmsTelemetry(now)) {
+    publishBmsTelemetry();
+  } else {
+    publishSimulatedBmsTelemetry();
+  }
+}
+
 void publishLoopedTelemetry() {
   setXFloatIfChanged("x0", loopedTelemetry.speedKmh, 1);
   setValueIfChanged("x1", static_cast<int32_t>(loopedTelemetry.motorRpm));
@@ -1116,6 +1144,7 @@ void loop() {
     lastLoopedTelemetryUpdate = now;
     updateLoopedTelemetry();
     publishLoopedTelemetry();
+    publishBmsDisplay(now);
   }
 
   now = millis();
