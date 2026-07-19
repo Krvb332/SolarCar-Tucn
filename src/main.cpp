@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#if defined(ESP32)
+#if defined(ARDUINO_ARCH_ESP32)
 #include "driver/twai.h"
 #else
 #include <SoftwareSerial.h>
@@ -107,7 +107,7 @@ constexpr uint8_t NEXTION_RX_PIN = 3;
 constexpr uint8_t NEXTION_TX_PIN = 2;
 constexpr uint8_t BMS_RX_PIN = 11;
 constexpr uint8_t BMS_TX_PIN = 12;
-#if defined(ESP32)
+#if defined(ARDUINO_ARCH_ESP32)
 constexpr gpio_num_t TPMS_CAN_TX_PIN = GPIO_NUM_5;
 constexpr gpio_num_t TPMS_CAN_RX_PIN = GPIO_NUM_4;
 #endif
@@ -143,7 +143,7 @@ static_assert(OFFSET_TEMPS + (ANT_TEMP_COUNT * 2) <= ANT_FRAME_SIZE,
 static_assert(OFFSET_MOS_DISCHARGE < ANT_FRAME_SIZE,
               "BMS MOS status offsets must fit inside the ANT frame");
 
-#if defined(ESP32)
+#if defined(ARDUINO_ARCH_ESP32)
 HardwareSerial nextion(1);
 HardwareSerial bmsSerial(2);
 #else
@@ -257,7 +257,7 @@ void activateNextionPort() {
     bmsSerial.end();
   }
 
-#if defined(ESP32)
+#if defined(ARDUINO_ARCH_ESP32)
   nextion.begin(NEXTION_BAUD, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
 #else
   nextion.begin(NEXTION_BAUD);
@@ -274,7 +274,7 @@ void activateBmsPort() {
     nextion.end();
   }
 
-#if defined(ESP32)
+#if defined(ARDUINO_ARCH_ESP32)
   bmsSerial.begin(BMS_BAUD, SERIAL_8N1, BMS_RX_PIN, BMS_TX_PIN);
 #else
   bmsSerial.begin(BMS_BAUD);
@@ -504,7 +504,7 @@ void publishTpmsDisplay(uint32_t now) {
 }
 
 void initialiseTpmsCan() {
-#if defined(ESP32)
+#if defined(ARDUINO_ARCH_ESP32)
   twai_general_config_t generalConfig =
       TWAI_GENERAL_CONFIG_DEFAULT(TPMS_CAN_TX_PIN, TPMS_CAN_RX_PIN, TWAI_MODE_NORMAL);
   twai_timing_config_t timingConfig = TWAI_TIMING_CONFIG_500KBITS();
@@ -522,7 +522,7 @@ void initialiseTpmsCan() {
 }
 
 void pollTpmsCan() {
-#if defined(ESP32)
+#if defined(ARDUINO_ARCH_ESP32)
   if (!tpmsCanReady) {
     return;
   }
