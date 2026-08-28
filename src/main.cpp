@@ -6,6 +6,8 @@
 #endif
 #include <string.h>
 
+#include "mitsuba_can.h"
+
 /*
   Teensy 4.1 <-> Nextion Intelligent NX8048P050-011C
 
@@ -17,12 +19,22 @@
     Teensy 4.1 pin 3, software RX  <- Nextion TX
     Teensy 4.1 pin 12, software TX -> ANT BMS RX
     Teensy 4.1 pin 11, software RX <- ANT BMS TX
+    Teensy 4.1 pin 22, CAN1 TX     -> CAN transceiver TXD (Mitsuba bus)
+    Teensy 4.1 pin 23, CAN1 RX     <- CAN transceiver RXD (Mitsuba bus)
     GND                    -> Nextion GND
     GND                    -> ANT BMS GND
     External 5 V supply    -> Nextion 5 V input
 
   Teensy 4.1 pins are 3.3 V and are not 5 V tolerant. If the Nextion TX line
   or BMS TX line outputs 5 V, level-shift it before connecting it to Teensy.
+
+  The Mitsuba bus runs at 500 kbit/s with extended 29 bit identifiers and needs
+  120 ohm termination at both ends plus a common ground with the controller.
+
+  Every value on this panel comes from a real source. Speed, RPM and the drive
+  block are decoded from Mitsuba CAN frames, the pack block from the ANT BMS
+  over UART. Anything with no source wired to this board stays at zero; nothing
+  here is simulated.
 
   The HMI uses page0 and xfloat numeric components. For xfloat fields with
   vvs1=1, write .val as value * 10. x1 has vvs1=0, so RPM is written directly.
@@ -43,10 +55,13 @@
     x9    id=18  MPPT Amp, 1 decimal         t9  id=17 "Amp"
     x7    id=24  MPPT Temp, 1 decimal        t12 id=25 "Temp"
     x8    id=26  MPPT Pow, 1 decimal         t8  id=27 "Pow"
-    x12   id=30  drive voltage, 1 decimal
-    x13   id=32  drive current, 1 decimal
-    x14   id=34  drive power, 1 decimal
-    x15   id=35  drive temperature, 1 decimal
+    x0    <- Mitsuba Frame 0 motor rpm, converted to km/h
+    x1    <- Mitsuba Frame 0 motor rpm, signed
+    x12   id=30  drive voltage, 1 decimal     <- Mitsuba Frame 0 battery voltage
+    x13   id=32  drive current, 1 decimal     <- Mitsuba Frame 0 battery current
+    x14   id=34  drive power, 1 decimal       <- computed, voltage * current
+    x15   id=35  drive temperature, 1 decimal <- Mitsuba Frame 0 FET temperature
+    x7-x11, z0   no source on this board, stay at zero
     x16          TPMS front-left pressure
     x17          TPMS front-right pressure
     x18          TPMS middle wheel pressure
@@ -57,52 +72,20 @@ namespace {
 constexpr uint32_t DEBUG_BAUD = 115200;
 constexpr uint32_t NEXTION_BAUD = 9600;
 constexpr uint32_t BMS_BAUD = 19200;
-constexpr uint32_t LOOPED_TELEMETRY_INTERVAL_MS = 250;
+constexpr uint32_t DISPLAY_REFRESH_INTERVAL_MS = 250;
 constexpr uint32_t PAGE_HEARTBEAT_INTERVAL_MS = 1000;
 constexpr uint32_t BMS_REQUEST_INTERVAL_MS = 1000;
-constexpr uint32_t BMS_RESPONSE_WINDOW_MS = 1000;
+// 140 bytes at 19200 8N1 take 73 ms, so 250 ms is already generous. Keeping
+// this at 1000 ms left the display frozen for most of every second whenever
+// the BMS was absent, because loop() returns early while the window is open.
+constexpr uint32_t BMS_RESPONSE_WINDOW_MS = 250;
 constexpr uint32_t BMS_STALE_LOG_INTERVAL_MS = 3000;
 constexpr uint32_t TPMS_SENSOR_TIMEOUT_MS = 2000;
 constexpr bool ENABLE_BMS_SERIAL_DEBUG = true;
 constexpr bool BMS_DEBUG_PRINT_RAW_FRAME = true;
 constexpr size_t BMS_DEBUG_RAW_BYTES_PER_LINE = 16;
-constexpr float LOOPED_BMS_SOC_MIN = 1.0f;
-constexpr float LOOPED_BMS_SOC_MAX = 100.0f;
-constexpr float LOOPED_BMS_SOC_STEP = 1.0f;
-constexpr float LOOPED_BMS_VOLTAGE_MAX = 150.0f;
-constexpr float LOOPED_BMS_VOLTAGE_STEP = 0.8f;
-constexpr float LOOPED_BMS_CURRENT_MAX = 100.0f;
-constexpr float LOOPED_BMS_CURRENT_STEP = 0.6f;
-constexpr float LOOPED_BMS_POWER_MAX = 3000.0f;
-constexpr float LOOPED_BMS_POWER_STEP = 35.0f;
-constexpr float LOOPED_BMS_TEMPERATURE_MAX = 100.0f;
-constexpr float LOOPED_BMS_TEMPERATURE_STEP = 0.5f;
-constexpr float LOOPED_MPPT_VOLTAGE_MAX = 150.0f;
-constexpr float LOOPED_MPPT_VOLTAGE_STEP = 0.7f;
-constexpr float LOOPED_MPPT_CURRENT_MAX = 50.0f;
-constexpr float LOOPED_MPPT_CURRENT_STEP = 0.4f;
-constexpr float LOOPED_MPPT_POWER_MAX = 2000.0f;
-constexpr float LOOPED_MPPT_POWER_STEP = 25.0f;
-constexpr float LOOPED_MPPT_TEMPERATURE_MAX = 100.0f;
-constexpr float LOOPED_MPPT_TEMPERATURE_STEP = 0.5f;
-constexpr float LOOPED_SECONDARY_VOLTAGE_MAX = 50.0f;
-constexpr float LOOPED_SECONDARY_VOLTAGE_STEP = 0.4f;
-constexpr float LOOPED_SPEED_MAX = 150.0f;
-constexpr float LOOPED_SPEED_STEP = 0.8f;
-constexpr uint32_t LOOPED_RPM_MAX = 2000;
-constexpr uint32_t LOOPED_RPM_STEP = 50;
-constexpr float LOOPED_DRIVE_POWER_MAX = 3000.0f;
-constexpr float LOOPED_DRIVE_POWER_STEP = 35.0f;
-constexpr float LOOPED_DRIVE_VOLTAGE_MAX = 150.0f;
-constexpr float LOOPED_DRIVE_VOLTAGE_STEP = 0.8f;
-constexpr float LOOPED_DRIVE_CURRENT_MAX = 100.0f;
-constexpr float LOOPED_DRIVE_CURRENT_STEP = 0.6f;
-constexpr float LOOPED_DRIVE_TEMPERATURE_MAX = 100.0f;
-constexpr float LOOPED_DRIVE_TEMPERATURE_STEP = 0.5f;
-constexpr float LOOPED_TPMS_PRESSURE_MAX = 3.0f;
-constexpr float LOOPED_TPMS_PRESSURE_STEP = 0.03f;
-constexpr uint32_t LOOPED_CENTER_GAUGE_MAX = 100;
-constexpr uint32_t LOOPED_CENTER_GAUGE_STEP = 2;
+constexpr bool ENABLE_MITSUBA_SERIAL_DEBUG = true;
+constexpr uint32_t MITSUBA_STATUS_LOG_INTERVAL_MS = 1000;
 constexpr uint8_t NEXTION_RX_PIN = 3;
 constexpr uint8_t NEXTION_TX_PIN = 2;
 constexpr uint8_t BMS_RX_PIN = 11;
@@ -171,29 +154,6 @@ struct BmsTelemetry {
   uint8_t maxCellId = 0;
 };
 
-struct LoopedTelemetry {
-  float bmsSoc = LOOPED_BMS_SOC_MIN;
-  float bmsVoltage = 0.0f;
-  float bmsCurrent = 0.0f;
-  float bmsPower = 0.0f;
-  float bmsTemperature = 0.0f;
-  float mpptVoltage = 0.0f;
-  float mpptCurrent = 0.0f;
-  float mpptPower = 0.0f;
-  float mpptTemperature = 0.0f;
-  float secondaryVoltage = 0.0f;
-  float speedKmh = 0.0f;
-  uint32_t motorRpm = 0;
-  float drivePower = 0.0f;
-  float driveVoltage = 0.0f;
-  float driveCurrent = 0.0f;
-  float driveTemperature = 0.0f;
-  float tpmsFrontLeft = 0.0f;
-  float tpmsFrontRight = 0.0f;
-  float tpmsMiddle = 0.0f;
-  uint16_t centerGauge = 0;
-};
-
 struct TpmsWheel {
   float pressureBar = 0.0f;
   int temperatureC = 0;
@@ -204,10 +164,10 @@ struct TpmsWheel {
 };
 
 BmsTelemetry bmsTelemetry = {};
-LoopedTelemetry loopedTelemetry = {};
 TpmsWheel tpmsWheels[5] = {};
 
-uint32_t lastLoopedTelemetryUpdate = 0;
+uint32_t lastDisplayRefresh = 0;
+uint32_t lastMitsubaStatusLog = 0;
 uint32_t lastPageHeartbeat = 0;
 uint32_t lastBmsRequest = 0;
 uint32_t lastBmsFrame = 0;
@@ -352,36 +312,6 @@ void setXFloatFromBms(const char *component, float value, uint8_t decimals) {
   setValue(component, scaledValue(value, decimals));
 }
 
-float loopFloatValue(float value, float maxValue, float step, int8_t &direction,
-                     float minValue = 0.0f) {
-  value += step * static_cast<float>(direction);
-  if (value >= maxValue) {
-    value = maxValue;
-    direction = -1;
-  } else if (value <= minValue) {
-    value = minValue;
-    direction = 1;
-  }
-
-  return value;
-}
-
-uint32_t loopUnsignedValue(uint32_t value, uint32_t maxValue, uint32_t step,
-                           int8_t &direction) {
-  int32_t nextValue =
-      static_cast<int32_t>(value) + (static_cast<int32_t>(step) * direction);
-
-  if (nextValue >= static_cast<int32_t>(maxValue)) {
-    nextValue = static_cast<int32_t>(maxValue);
-    direction = -1;
-  } else if (nextValue <= 0) {
-    nextValue = 0;
-    direction = 1;
-  }
-
-  return static_cast<uint32_t>(nextValue);
-}
-
 uint16_t readU16BE(const uint8_t *p) {
   return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
 }
@@ -438,12 +368,14 @@ void publishBmsTelemetry() {
   setXFloatFromBms("x2", averageTemperature, 1);
 }
 
-void publishSimulatedBmsTelemetry() {
-  setXFloatFromBms("x3", loopedTelemetry.bmsSoc, 1);
-  setXFloatFromBms("x4", loopedTelemetry.bmsVoltage, 1);
-  setXFloatFromBms("x5", loopedTelemetry.bmsCurrent, 1);
-  setXFloatFromBms("x6", loopedTelemetry.bmsPower, 1);
-  setXFloatFromBms("x2", loopedTelemetry.bmsTemperature, 1);
+// Without a fresh BMS frame the panel shows zeros. It must never show a value
+// the car did not actually measure.
+void publishZeroBmsTelemetry() {
+  setXFloatFromBms("x3", 0.0f, 1);
+  setXFloatFromBms("x4", 0.0f, 1);
+  setXFloatFromBms("x5", 0.0f, 1);
+  setXFloatFromBms("x6", 0.0f, 1);
+  setXFloatFromBms("x2", 0.0f, 1);
 }
 
 bool hasFreshBmsTelemetry(uint32_t now) {
@@ -454,26 +386,26 @@ void publishBmsDisplay(uint32_t now) {
   if (hasFreshBmsTelemetry(now)) {
     publishBmsTelemetry();
   } else {
-    publishSimulatedBmsTelemetry();
+    publishZeroBmsTelemetry();
   }
 }
 
-void publishLoopedTelemetry() {
-  setXFloatIfChanged("x0", loopedTelemetry.speedKmh, 1);
-  setValueIfChanged("x1", static_cast<int32_t>(loopedTelemetry.motorRpm));
+// Speed, rpm and the drive block come straight off the Mitsuba CAN frames.
+// x7-x11 (MPPT) and z0 have no source on this board, so they keep the zero that
+// clearDisplayValues() wrote at boot and are never touched again.
+void publishMotorDisplay(uint32_t now) {
+  MitsubaTelemetry motor;
+  const bool fresh = mitsuba::snapshot(motor) && mitsuba::isFresh(now);
 
-  setXFloatIfChanged("x11", loopedTelemetry.mpptVoltage, 1);
-  setXFloatIfChanged("x10", loopedTelemetry.secondaryVoltage, 1);
-  setXFloatIfChanged("x9", loopedTelemetry.mpptCurrent, 1);
-  setXFloatIfChanged("x7", loopedTelemetry.mpptTemperature, 1);
-  setXFloatIfChanged("x8", loopedTelemetry.mpptPower, 1);
+  setXFloatIfChanged("x0", fresh ? motor.speedKmh : 0.0f, 1);
+  setValueIfChanged("x1", fresh ? static_cast<int32_t>(motor.motorRpm) : 0);
 
-  setXFloatIfChanged("x12", loopedTelemetry.driveVoltage, 1);
-  setXFloatIfChanged("x13", loopedTelemetry.driveCurrent, 1);
-  setXFloatIfChanged("x14", loopedTelemetry.drivePower, 1);
-  setXFloatIfChanged("x15", loopedTelemetry.driveTemperature, 1);
-
-  setValueIfChanged("z0", loopedTelemetry.centerGauge);
+  // Drive block, all from Frame 0. Current and power keep their sign so that
+  // regeneration is visible on the dashboard as a negative reading.
+  setXFloatIfChanged("x12", fresh ? motor.batteryVoltage : 0.0f, 1);
+  setXFloatIfChanged("x13", fresh ? motor.batteryCurrent : 0.0f, 1);
+  setXFloatIfChanged("x14", fresh ? motor.batteryPower : 0.0f, 1);
+  setXFloatIfChanged("x15", fresh ? motor.fetTemperatureC : 0.0f, 1);
 }
 
 bool hasFreshTpmsWheel(uint8_t wheelId, uint32_t now) {
@@ -483,13 +415,6 @@ bool hasFreshTpmsWheel(uint8_t wheelId, uint32_t now) {
 
 void publishTpmsDisplay(uint32_t now) {
   const char *const pressureComponents[5] = {"", "x16", "x17", "x18", nullptr};
-  const float simulatedPressures[5] = {
-      0.0f,
-      loopedTelemetry.tpmsFrontLeft,
-      loopedTelemetry.tpmsFrontRight,
-      loopedTelemetry.tpmsMiddle,
-      0.0f,
-  };
 
   for (uint8_t wheelId = 1; wheelId <= 4; ++wheelId) {
     if (pressureComponents[wheelId] == nullptr) {
@@ -497,8 +422,7 @@ void publishTpmsDisplay(uint32_t now) {
     }
 
     const float pressure =
-        hasFreshTpmsWheel(wheelId, now) ? tpmsWheels[wheelId].pressureBar
-                                        : simulatedPressures[wheelId];
+        hasFreshTpmsWheel(wheelId, now) ? tpmsWheels[wheelId].pressureBar : 0.0f;
     setXFloatIfChanged(pressureComponents[wheelId], pressure, 1);
   }
 }
@@ -548,75 +472,6 @@ void pollTpmsCan() {
     wheel.lastMessageMs = millis();
   }
 #endif
-}
-
-void updateLoopedTelemetry() {
-  static int8_t directions[] = {
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-      1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-  };
-  uint8_t directionIndex = 0;
-
-  loopedTelemetry.bmsSoc =
-      loopFloatValue(loopedTelemetry.bmsSoc, LOOPED_BMS_SOC_MAX, LOOPED_BMS_SOC_STEP,
-                     directions[directionIndex++], LOOPED_BMS_SOC_MIN);
-  loopedTelemetry.bmsVoltage =
-      loopFloatValue(loopedTelemetry.bmsVoltage, LOOPED_BMS_VOLTAGE_MAX,
-                     LOOPED_BMS_VOLTAGE_STEP, directions[directionIndex++]);
-  loopedTelemetry.bmsCurrent =
-      loopFloatValue(loopedTelemetry.bmsCurrent, LOOPED_BMS_CURRENT_MAX,
-                     LOOPED_BMS_CURRENT_STEP, directions[directionIndex++]);
-  loopedTelemetry.bmsPower =
-      loopFloatValue(loopedTelemetry.bmsPower, LOOPED_BMS_POWER_MAX, LOOPED_BMS_POWER_STEP,
-                     directions[directionIndex++]);
-  loopedTelemetry.bmsTemperature = loopFloatValue(
-      loopedTelemetry.bmsTemperature, LOOPED_BMS_TEMPERATURE_MAX,
-      LOOPED_BMS_TEMPERATURE_STEP, directions[directionIndex++]);
-  loopedTelemetry.mpptVoltage =
-      loopFloatValue(loopedTelemetry.mpptVoltage, LOOPED_MPPT_VOLTAGE_MAX,
-                     LOOPED_MPPT_VOLTAGE_STEP, directions[directionIndex++]);
-  loopedTelemetry.mpptCurrent =
-      loopFloatValue(loopedTelemetry.mpptCurrent, LOOPED_MPPT_CURRENT_MAX,
-                     LOOPED_MPPT_CURRENT_STEP, directions[directionIndex++]);
-  loopedTelemetry.mpptPower =
-      loopFloatValue(loopedTelemetry.mpptPower, LOOPED_MPPT_POWER_MAX,
-                     LOOPED_MPPT_POWER_STEP, directions[directionIndex++]);
-  loopedTelemetry.mpptTemperature = loopFloatValue(
-      loopedTelemetry.mpptTemperature, LOOPED_MPPT_TEMPERATURE_MAX,
-      LOOPED_MPPT_TEMPERATURE_STEP, directions[directionIndex++]);
-  loopedTelemetry.secondaryVoltage = loopFloatValue(
-      loopedTelemetry.secondaryVoltage, LOOPED_SECONDARY_VOLTAGE_MAX,
-      LOOPED_SECONDARY_VOLTAGE_STEP, directions[directionIndex++]);
-  loopedTelemetry.speedKmh =
-      loopFloatValue(loopedTelemetry.speedKmh, LOOPED_SPEED_MAX, LOOPED_SPEED_STEP,
-                     directions[directionIndex++]);
-  loopedTelemetry.motorRpm =
-      loopUnsignedValue(loopedTelemetry.motorRpm, LOOPED_RPM_MAX, LOOPED_RPM_STEP,
-                        directions[directionIndex++]);
-  loopedTelemetry.drivePower =
-      loopFloatValue(loopedTelemetry.drivePower, LOOPED_DRIVE_POWER_MAX,
-                     LOOPED_DRIVE_POWER_STEP, directions[directionIndex++]);
-  loopedTelemetry.driveVoltage =
-      loopFloatValue(loopedTelemetry.driveVoltage, LOOPED_DRIVE_VOLTAGE_MAX,
-                     LOOPED_DRIVE_VOLTAGE_STEP, directions[directionIndex++]);
-  loopedTelemetry.driveCurrent =
-      loopFloatValue(loopedTelemetry.driveCurrent, LOOPED_DRIVE_CURRENT_MAX,
-                     LOOPED_DRIVE_CURRENT_STEP, directions[directionIndex++]);
-  loopedTelemetry.driveTemperature = loopFloatValue(
-      loopedTelemetry.driveTemperature, LOOPED_DRIVE_TEMPERATURE_MAX,
-      LOOPED_DRIVE_TEMPERATURE_STEP, directions[directionIndex++]);
-  loopedTelemetry.tpmsFrontLeft =
-      loopFloatValue(loopedTelemetry.tpmsFrontLeft, LOOPED_TPMS_PRESSURE_MAX,
-                     LOOPED_TPMS_PRESSURE_STEP, directions[directionIndex++]);
-  loopedTelemetry.tpmsFrontRight =
-      loopFloatValue(loopedTelemetry.tpmsFrontRight, LOOPED_TPMS_PRESSURE_MAX,
-                     LOOPED_TPMS_PRESSURE_STEP, directions[directionIndex++]);
-  loopedTelemetry.tpmsMiddle =
-      loopFloatValue(loopedTelemetry.tpmsMiddle, LOOPED_TPMS_PRESSURE_MAX,
-                     LOOPED_TPMS_PRESSURE_STEP, directions[directionIndex++]);
-  loopedTelemetry.centerGauge = static_cast<uint16_t>(
-      loopUnsignedValue(loopedTelemetry.centerGauge, LOOPED_CENTER_GAUGE_MAX,
-                        LOOPED_CENTER_GAUGE_STEP, directions[directionIndex++]));
 }
 
 void debugPrintHexByte(uint8_t value) {
@@ -1274,6 +1129,48 @@ void logBmsStatusIfNeeded(uint32_t now) {
   }
 }
 
+void logMitsubaStatusIfNeeded(uint32_t now) {
+  if (!ENABLE_MITSUBA_SERIAL_DEBUG) {
+    return;
+  }
+
+  if (now - lastMitsubaStatusLog < MITSUBA_STATUS_LOG_INTERVAL_MS) {
+    return;
+  }
+
+  lastMitsubaStatusLog = now;
+
+  MitsubaTelemetry motor;
+  if (!mitsuba::snapshot(motor) || !mitsuba::isFresh(now)) {
+    Serial.print("Mitsuba: no fresh frames, probing request id 0x");
+    Serial.println(mitsuba::activeRequestId(), HEX);
+    return;
+  }
+
+  Serial.print("Mitsuba frames=");
+  Serial.print(mitsuba::frameCount());
+  Serial.print(" req=0x");
+  Serial.print(mitsuba::activeRequestId(), HEX);
+  Serial.print(" rpm=");
+  Serial.print(motor.motorRpm);
+  Serial.print(" speed=");
+  Serial.print(motor.speedKmh, 1);
+  Serial.print("km/h V=");
+  Serial.print(motor.batteryVoltage, 1);
+  Serial.print(" I=");
+  Serial.print(motor.batteryCurrent, 1);
+  Serial.print(" Tfet=");
+  Serial.print(motor.fetTemperatureC, 0);
+  Serial.print("C thr=");
+  Serial.print(motor.throttlePercent, 1);
+  Serial.print("% regen=");
+  Serial.print(motor.regenActive ? "yes" : "no");
+  Serial.print(" drive=");
+  Serial.print(motor.driveAction);
+  Serial.print(" err=0x");
+  Serial.println(motor.errorFlags, HEX);
+}
+
 bool isBmsResponseWindowActive(uint32_t now) {
   if (!awaitingBmsResponse) {
     return false;
@@ -1296,6 +1193,7 @@ void setup() {
 
   initialiseNextion();
   initialiseTpmsCan();
+  mitsuba::begin();
 
   Serial.println("Teensy 4.1 Nextion page0 interface ready");
   Serial.print("ANT BMS reader on software serial RX=");
@@ -1307,10 +1205,16 @@ void setup() {
   Serial.print("BMS serial debug=");
   Serial.println(ENABLE_BMS_SERIAL_DEBUG ? "enabled" : "disabled");
   Serial.println("Open the serial monitor at 115200 baud to watch BMS requests, raw frames, and decoded values.");
+  Serial.println("Mitsuba speed and RPM come from CAN1; no telemetry on this panel is simulated.");
 }
 
 void loop() {
   pollTpmsCan();
+
+  // Must run before the early return below, otherwise the Mitsuba stops being
+  // polled for as long as the BMS response window stays open.
+  mitsuba::service(millis());
+
   sendBmsRequestIfNeeded();
 
   if (isBmsResponseWindowActive(millis())) {
@@ -1323,10 +1227,9 @@ void loop() {
   readNextion();
 
   uint32_t now = millis();
-  if (now - lastLoopedTelemetryUpdate >= LOOPED_TELEMETRY_INTERVAL_MS) {
-    lastLoopedTelemetryUpdate = now;
-    updateLoopedTelemetry();
-    publishLoopedTelemetry();
+  if (now - lastDisplayRefresh >= DISPLAY_REFRESH_INTERVAL_MS) {
+    lastDisplayRefresh = now;
+    publishMotorDisplay(now);
     publishBmsDisplay(now);
     publishTpmsDisplay(now);
   }
@@ -1338,4 +1241,5 @@ void loop() {
   }
 
   logBmsStatusIfNeeded(millis());
+  logMitsubaStatusIfNeeded(millis());
 }
